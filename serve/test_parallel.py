@@ -29,6 +29,7 @@ slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args        # #997: the first window over two slots fails
 agenda = "--agenda" in args           # D4-7 fase 2: emit the per-state BADM (STRATA_BATCH_AGENDA) during a read
+foreign = "--foreign-done" in args    # D4-7 bug: a stale DONE+BADM of ANOTHER request on the shared control stream
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -45,10 +46,13 @@ print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
+BIG = list(b"BIGREPLY")    # a reply long enough that the request is still decoding when another one is admitted
 def reply(ids):            # the rest of the reply after what the prompt already ends with (a request continued)
     ids = [int(x) for x in ids]
     long_one = any(ids[i:i + len(LONG)] == LONG for i in range(len(ids)))
-    R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [257]
+    big_one = any(ids[i:i + len(BIG)] == BIG for i in range(len(ids)))
+    R = (list(b"ok, " + b"la " * 60 + b"done.") if big_one else
+         list(b"ok, " + b"la " * 15 + b"done.") if long_one else list(b"ok, done.")) + [257]
     k = max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
@@ -92,6 +96,17 @@ while True:
         slot = int(f[1]) if f[0] == "BGEN" else None
         max_new = int(f[2] if f[0] == "BGEN" else f[1])
         ids = f[-1].split(",")
+        # a DONE's `reused` is the request's OWN: a long prompt reports its length, a short one 0.  A crossed
+        # response (the short one showing the long one's `reused`) is the D4-7 bug made visible in `cached_tokens`.
+        reused_n = len(ids) if len(ids) > 1000 else 0
+        if foreign:
+            # D4-7 bug repro: another request's tail is still on the shared control stream when THIS read starts
+            # - a DONE whose prompt count is not this request's (37442 vs len(ids)) and a BADM for another slot.
+            # A server that attributes them to THIS request answers it with the other one's usage and 0 tokens
+            # (exactly the canary: prompt 63, cached_tokens 33573, completion_tokens 0).
+            print("DONE 0 37442 5.0 0.0 cancel 0 0 33573", flush=True)
+            other = (slot + 1) % max(slots, 1) if slot is not None else 1
+            print(f"BADM {other} 0", flush=True)
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
         toks = reply(ids)
@@ -127,7 +142,7 @@ while True:
             if log:
                 log.write(f"YIELD {given[0]} {given[1]}\n"); log.flush()
             print(f"YIELDED {given[0]} {given[1]}", flush=True)
-            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 0", flush=True)
+            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {reused_n}", flush=True)
             if slot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
@@ -142,7 +157,7 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 0", flush=True)
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused_n}", flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -257,7 +272,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False, agenda=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, agenda=False, foreign=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -268,6 +283,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
         extra += ["--agenda"] if agenda else []
+        extra += ["--foreign-done"] if foreign else []
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = StrataEngine("strata", extra)
@@ -535,6 +551,50 @@ class ParallelService(unittest.TestCase):
                 self.assertEqual(len(self.svc.history), 3)
                 self.assertFalse(self.svc.status["busy"])
             self.assertFalse(any(self.engine.slot_busy))
+        finally:
+            os.environ.pop("STRATA_BATCH_AGENDA", None)
+
+    def test_each_request_keeps_its_own_usage_under_concurrency(self):
+        """D4-7 bug: while one request decodes in a slot, another one's admission `DONE` lands on the shared
+        stream; the decoding one must still answer with ITS OWN `usage`.  A long prompt reports its own `reused`;
+        the victim (short prompt) must keep 0 - never the other request's `cached_tokens`."""
+        os.environ["STRATA_BATCH_AGENDA"] = "1"
+        try:
+            self.start(3, agenda=True)
+            victim_prompt, long_prompt = "BIGREPLY", "long " * 400   # the long one's `reused` is its own length
+            got, errs = {}, []
+
+            def go(text, mt):
+                try:
+                    got[text] = self.chat(text, max_tokens=mt)
+                except Exception as e:   # noqa: BLE001 - reported below
+                    errs.append(e)
+
+            v = threading.Thread(target=go, args=(victim_prompt, 400))   # decodes ~120 tokens: still busy
+            v.start()
+            time.sleep(0.2)
+            l = threading.Thread(target=go, args=(long_prompt, 8))       # admitted while the victim decodes
+            l.start()
+            v.join(30)
+            l.join(30)
+            self.assertEqual(errs, [])
+            self.assertGreater(got[long_prompt]["usage"]["prompt_tokens"], 1000, got)
+            self.assertEqual(got[victim_prompt]["usage"]["prompt_tokens_details"]["cached_tokens"], 0, got)
+        finally:
+            os.environ.pop("STRATA_BATCH_AGENDA", None)
+
+    def test_a_stale_done_is_not_this_requests(self):
+        """D4-7 bug (canary 2026-10-07): another request's `DONE`/`BADM` left on the shared control stream must
+        not be attributed to this request.  The short request must get ITS OWN usage (no `cached_tokens` of the
+        other one, no `completion_tokens: 0`, its own answer)."""
+        os.environ["STRATA_BATCH_AGENDA"] = "1"
+        try:
+            self.start(3, agenda=True, foreign=True)
+            r = self.chat("hi", max_tokens=16)          # its admission finds the foreign DONE/BADM
+            c = r["choices"][0]
+            self.assertEqual(c["message"]["content"], "ok, done.", r.get("usage"))
+            self.assertGreater(r["usage"]["completion_tokens"], 0, r.get("usage"))
+            self.assertEqual(r["usage"]["prompt_tokens_details"]["cached_tokens"], 0, r.get("usage"))
         finally:
             os.environ.pop("STRATA_BATCH_AGENDA", None)
 

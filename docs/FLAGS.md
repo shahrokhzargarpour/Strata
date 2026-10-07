@@ -123,6 +123,16 @@ stream, `BADM <slot> <state> <read_to> <total>` with `state` in `wait_slot|readi
 the terminal line carries 0/1); the terminal `BADM <slot> <0|1>` is unchanged, so a server that does not know
 the state lines (or an engine with the switch off) reads exactly the base protocol.
 
+The control stream is shared by every request, so with the switch on the server **demultiplexes** it: an
+admission accepts only the `DONE` whose prompt count equals its own prompt (the engine's second field) and only
+the terminal `BADM` whose slot is its own (in solo mode every `BADM` is another request's, because a `GEN`
+never prints one). Without that demux a request could read another one's `DONE`/`BADM` and answer it with the
+other's `usage` (the 2026-10-07 canary: a 63-token prompt answered with `cached_tokens: 33573` and
+`completion_tokens: 0`). This is **server-side** matching on existing fields - **no protocol change** - and it
+is inert with the switch off (the fields are not compared and the base path is byte for byte). The response's
+usage is likewise taken from the request's OWN capture of its `DONE` (per thread), not from the engine's single
+shared `last`.
+
 | Knob | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
 | --- | --- | --- | --- | --- | --- |
 | `STRATA_BATCH_AGENDA` | unset / `0` (**off**) | Turns the continuous agenda on - engine AND server. The read advances one fine chunk per turn, the decode window runs first, the step budget is by tokens, the server's admission queue releases the control lines while waiting for a slot and ages long waiters, and the engine emits the per-state `BADM`. | `--serve` with `--batch`. Inert without `--batch`, under `--batch-groups` (the pipelined path), and when a layer split has no active slot (nothing to decode-first: the read stays one pass). The server side is inert without `--batch` (there are no slots to wait for). | It is **not** a mid-window row insert: `batch_step` is untouched and a window is rebuilt from the active slots every step (the verifier's "a window keeps every row" invariant is unmoved). It does **not** change the prompt arithmetic and does **not** raise the slot count (still `--batch 4`, rows capped at `kVerifyMaxT`). The server still serves **one admission at a time** (the control stream is not slot-demultiplexed): the switch removes the head-of-line block of a request *waiting for a slot*, not the serialization of two prompt reads. | `layer/delta4-d7` (phases 1-2) |

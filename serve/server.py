@@ -775,6 +775,10 @@ class StrataEngine:
             self.adm_q = admit_queue.AdmissionQueue()
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+            # D4-7 bug: `last` is the engine's ONE parsed DONE, so with two requests at once it can belong to the
+            # other one (the response then carries the other request's usage).  Each request's thread captures ITS
+            # OWN DONE in `tls.last` and the response reads that; created once, kept across a restart.
+            self.tls = threading.local()
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
         # D4-7 fase 2 (opt-in): STRATA_BATCH_AGENDA also drives the server - the admission queue releases the
         # control lines while a request waits for a free slot, ages long waiters, and follows the engine's
@@ -1012,10 +1016,18 @@ class StrataEngine:
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None):
+    def _control(self, cancel, on_token, stop_when=None, expect_pt=None, expect_slot=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
-        true sends STOP once (the request is then read to its DONE)."""
+        true sends STOP once (the request is then read to its DONE).
+
+        D4-7 (STRATA_BATCH_AGENDA): the control stream is shared by every request, so a `DONE`/`BADM` left on it
+        by another one (a long read that gave way and was cancelled, a slot that finished) used to be read as
+        THIS request's: the canary answered a 63-token prompt with the other request's `cached_tokens` and
+        `completion_tokens: 0`.  `expect_pt` (this request's prompt length) and `expect_slot` (its slot) demux
+        them: a `DONE` whose prompt count is not `expect_pt`, or a `BADM` whose slot is not `expect_slot`, is
+        another request's and is skipped.  In solo mode (`expect_slot is None`) every `BADM` is another
+        request's, because a `GEN` never prints one."""
         stopped = False
         while True:
             try:
@@ -1049,6 +1061,10 @@ class StrataEngine:
                     stopped = True
                 yield None
             elif line.startswith("DONE"):
+                f = line.split()
+                if expect_pt is not None and len(f) >= 3 and f[2].isdigit() and int(f[2]) != expect_pt:
+                    btrace("ctl<", "stale DONE (not this request's prompt)", line.strip()[:60])
+                    continue                              # another request's DONE: skip it
                 self._parse_done(line)
                 self._last_done = line
             elif line.startswith("BADM "):
@@ -1057,10 +1073,18 @@ class StrataEngine:
                     # D4-7 fase 2: the engine's per-state admission line (STRATA_BATCH_AGENDA only) - progress,
                     # not the terminal BADM: publish the state and keep reading.  A server with the switch off
                     # never sees one (the base engine emits only `BADM <slot> <0|1>`).
+                    if expect_slot is not None and prog[0] != expect_slot:
+                        continue                              # another slot's progress
                     self._adm_progress = prog
                     yield None
                     continue
                 f = line.split()
+                if expect_slot is not None and len(f) >= 2 and f[1].lstrip("-").isdigit() and int(f[1]) != expect_slot:
+                    btrace("ctl<", "stale BADM (another slot)", line.strip()[:60])
+                    continue                                  # another slot's admission result
+                if expect_slot is None and expect_pt is not None:
+                    btrace("ctl<", "stale BADM (solo reads none)", line.strip()[:60])
+                    continue                                  # a solo GEN never prints a BADM: another request's
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
@@ -1073,7 +1097,8 @@ class StrataEngine:
                 self._ctl_result = ("done", None)
                 return
 
-    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
+    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None,
+                       expect_pt: int | None = None, expect_slot: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
         `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
@@ -1090,9 +1115,16 @@ class StrataEngine:
             if line is None:
                 return None
             if line.startswith("DONE"):
+                f = line.split()
+                if expect_pt is not None and len(f) >= 3 and f[2].isdigit() and int(f[2]) != expect_pt:
+                    continue                          # another request's DONE (D4-7 demux)
                 self._parse_done(line)
             if admit_queue.parse_progress(line) is not None:
                 continue                              # the admission's own progress, never the terminal BADM
+            if line.startswith("BADM ") and expect_slot is not None:
+                f = line.split()
+                if len(f) >= 2 and f[1].lstrip("-").isdigit() and int(f[1]) != expect_slot:
+                    continue                          # another slot's admission result (D4-7 demux)
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
@@ -1223,6 +1255,8 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
+        if self.agenda:
+            self.tls.last = None                        # D4-7: never a previous request's figures on this thread
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
@@ -1237,6 +1271,7 @@ class StrataEngine:
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again = 0, 0
+        req_last = None           # D4-7 bug: THIS request's own DONE (captured while it reads it), not the shared
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -1255,7 +1290,8 @@ class StrataEngine:
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+                    for x in self._control(cancel, pending.append, stop_when=others,
+                                           expect_pt=len(prompt) if self.agenda else None):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -1270,6 +1306,8 @@ class StrataEngine:
                                 if reserved is not None:
                                     self._send(f"BYIELD {reserved}")
                             yield None
+                    if self.agenda and isinstance(self.last, dict):
+                        req_last = dict(self.last)          # the solo read's own DONE (this request's)
                     phase = "none"                          # its DONE is read
                     while pending:
                         t = pending.pop(0)
@@ -1345,7 +1383,9 @@ class StrataEngine:
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._adm_progress = None
                     asked = False
-                    for x in self._control(cancel, pending.append):
+                    for x in self._control(cancel, pending.append,
+                                           expect_pt=len(prompt) if self.agenda else None,
+                                           expect_slot=slot if self.agenda else None):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
@@ -1357,6 +1397,8 @@ class StrataEngine:
                                 asked = True
                             yield None
                     cont = bool(self._ctl_result and self._ctl_result[1])
+                    if self.agenda and isinstance(self.last, dict):
+                        req_last = dict(self.last)          # the admission's own DONE (this request's)
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -1409,6 +1451,8 @@ class StrataEngine:
                                    "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
                             upd.update(bdone_drafts(f))
                             self.last = {**self.last, **upd}
+                            if req_last is not None:
+                                req_last = {**req_last, **upd}   # D4-7: this request's own figures, kept apart
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
@@ -1434,9 +1478,10 @@ class StrataEngine:
                     phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE", born=born)
+                    self._drain_control("DONE", born=born, expect_pt=len(prompt) if self.agenda else None)
                 elif phase == "admit":
-                    line = self._drain_control("BADM", born=born)
+                    line = self._drain_control("BADM", born=born, expect_pt=len(prompt) if self.agenda else None,
+                                               expect_slot=slot if (self.agenda and slot is not None) else None)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
@@ -1458,6 +1503,10 @@ class StrataEngine:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
+            # D4-7 bug: publish THIS request's own figures for the response (this thread only), so a DONE that
+            # arrived for another request meanwhile cannot be recorded as this one's.
+            if self.agenda and isinstance(req_last, dict):
+                self.tls.last = req_last
 
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
@@ -3299,10 +3348,15 @@ class Service:
                     # it is released the next request sets its own status, which this must not record or clear
                     with self.status_lock:
                         if st.get("busy"):
-                            # only this request's DONE counts: same object means no DONE arrived (death, error,
-                            # disconnect)
-                            last = dict(getattr(self.engine, "last", {}) or {}) \
-                                if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            # D4-7 bug: this request's own figures, captured by its own thread while it read its
+                            # DONE (only with STRATA_BATCH_AGENDA).  Fallback: only a DONE that replaced
+                            # engine.last counts (same object means none arrived: death, error, disconnect).
+                            req_last = getattr(getattr(self.engine, "tls", None), "last", None)
+                            if isinstance(req_last, dict):
+                                last = dict(req_last)
+                            else:
+                                last = dict(getattr(self.engine, "last", {}) or {}) \
+                                    if getattr(self.engine, "last", None) is not engine_last0 else {}
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -3341,7 +3395,9 @@ class Service:
                             t["drafts_offered"] += last.get("drafts_offered") or 0
                             t["drafts_accepted"] += last.get("drafts_accepted") or 0
                             fresh = getattr(self.engine, "last", None)
-                            if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                            # D4-7: with the per-request capture, the clock is THIS request's; else the engine's
+                            # `last` for this request is the one that replaced `before`.
+                            if isinstance(req_last, dict) or (fresh is not None and fresh is not before):
                                 timings = request_timings(seen, n, last)
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
