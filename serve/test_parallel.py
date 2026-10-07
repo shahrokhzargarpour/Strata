@@ -5,6 +5,7 @@ real StrataEngine and Service, so the server's side is tested without a GPU: req
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -15,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
+from serve import admit_queue as aq
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, Service, StrataEngine, bdone_drafts, engine_args, parallel_args, serve
 
@@ -26,6 +28,7 @@ args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
 fail = "--fail-window" in args        # #997: the first window over two slots fails
+agenda = "--agenda" in args           # D4-7 fase 2: emit the per-state BADM (STRATA_BATCH_AGENDA) during a read
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -98,6 +101,10 @@ while True:
         for q in range(CH, len(ids) - 1, CH):
             time.sleep(STEP / 2)
             print(f"PP {q} {len(ids)} 1 1", flush=True)
+            if agenda and slot is not None:
+                # D4-7 fase 2: the per-state admission line (only with STRATA_BATCH_AGENDA): `BADM <slot> <state>
+                # <read_to> <total>`, the state word where the terminal line carries 0/1.
+                print(f"BADM {slot} reading {q} {len(ids)}", flush=True)
             held = []
             while True:
                 try:
@@ -124,6 +131,8 @@ while True:
             if slot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
+        if agenda and slot is not None:
+            print(f"BADM {slot} ready {len(ids)} {len(ids)}", flush=True)   # the read is done: READY
         n = 1 if slot is not None else max_new
         out = 0
         for t in toks[:n]:
@@ -248,7 +257,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False, fail=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, agenda=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -258,6 +267,7 @@ class ParallelService(unittest.TestCase):
         extra = ["--batch", str(slots)] + (["--fit", str(fit)] if fit is not None else []) + ["--log", str(self.log)]
         extra += ["--slotcache"] if slot_cache else []
         extra += ["--fail-window"] if fail else []
+        extra += ["--agenda"] if agenda else []
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = StrataEngine("strata", extra)
@@ -468,6 +478,65 @@ class ParallelService(unittest.TestCase):
         note = self.engine.death_note()
         self.assertIn("exited (code 1)", note)
         self.assertIn("verify batch: layer 34 never rang (graph finished)", note)
+
+    # ── D4-7 fase 2: the admission agenda (STRATA_BATCH_AGENDA) ─────────────────────────────────────────────
+    def test_agenda_off_by_default_server(self):
+        """The switch absent: the server is the base tag's (no aging, the base yield cap)."""
+        self.start(2)
+        self.assertFalse(self.engine.agenda)
+        self.assertEqual(self.engine._yields_max(), StrataEngine.YIELDS_MAX)
+
+    def test_the_agenda_switch_reaches_the_server(self):
+        """STRATA_BATCH_AGENDA=1 turns on the queue's aging and lets a long read give way more often."""
+        os.environ["STRATA_BATCH_AGENDA"] = "1"
+        try:
+            self.start(3)
+            self.assertTrue(self.engine.agenda)
+            self.assertEqual(self.engine._yields_max(), StrataEngine.YIELDS_MAX_AGENDA)
+        finally:
+            os.environ.pop("STRATA_BATCH_AGENDA", None)
+
+    def test_the_admission_states_are_followed(self):
+        """D4-7 fase 2: with STRATA_BATCH_AGENDA the engine's per-state BADM keeps the server's view of a read
+        ('reading' ... 'ready'), and the answers are unchanged.  Two requests hold slots while a third one's long
+        prompt is read beside them, so the engine's per-state line (one per admission chunk) is exercised."""
+        os.environ["STRATA_BATCH_AGENDA"] = "1"
+        try:
+            self.start(3, agenda=True)
+            seen, stop = [], threading.Event()
+
+            def watch():
+                while not stop.is_set():
+                    p = self.engine._adm_progress
+                    if p is not None:
+                        seen.append(p)
+                    time.sleep(0.003)
+
+            w = threading.Thread(target=watch, daemon=True)
+            w.start()
+            a = threading.Thread(target=lambda: self.chat("alpha LONGREPLY", max_tokens=200))
+            a.start()
+            time.sleep(0.03)
+            b = threading.Thread(target=lambda: self.chat("beta LONGREPLY", max_tokens=200))
+            b.start()
+            time.sleep(0.03)
+            long_r = self.chat("long " * 600, max_tokens=64)   # ~3000 tokens: the read crosses many fine chunks
+            a.join(30)
+            b.join(30)
+            stop.set()
+            w.join(2)
+            self.assertEqual(long_r["choices"][0]["message"]["content"], "ok, done.")
+            states = [p[1] for p in seen]
+            self.assertTrue(states, "the engine's per-state BADM reached the server")
+            self.assertTrue(set(states) <= set(aq.STATES), states)
+            self.assertIn("reading", states, states)
+            # every request finished and no slot is left busy
+            with self.svc.status_lock:
+                self.assertEqual(len(self.svc.history), 3)
+                self.assertFalse(self.svc.status["busy"])
+            self.assertFalse(any(self.engine.slot_busy))
+        finally:
+            os.environ.pop("STRATA_BATCH_AGENDA", None)
 
 
 if __name__ == "__main__":

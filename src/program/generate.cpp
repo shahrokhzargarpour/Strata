@@ -9527,10 +9527,15 @@ int main(int argc, char** argv) {
                     q = r;
                     if (agenda_on) {
                         adm.advance_chunk(adv);   // READING advances exactly one admission chunk
-                        if (admit_slot >= 0)       // the admission's state (stderr; the wire BADM below is unchanged)
-                            std::fprintf(stderr, "strata batch: BADM %d %s %lld of %lld\n", admit_slot,
-                                         strata::core::adm_state_name(adm.state), (long long) adm.read_to,
-                                         (long long) adm.total);
+                        if (admit_slot >= 0) {
+                            // D4-7 fase 2: the per-state admission line, on the CONTROL stream, so the server
+                            // can follow the read's progress: `BADM <slot> <state> <read_to> <total>` (a state
+                            // word where the terminal line carries 0/1).  The terminal `BADM <slot> <cont>` below
+                            // is unchanged, so an engine without the switch emits only that one, byte for byte.
+                            std::printf("BADM %d %s %lld %lld\n", admit_slot, strata::core::adm_state_name(adm.state),
+                                        (long long) adm.read_to, (long long) adm.total);
+                            std::fflush(stdout);
+                        }
                     }
                     if (q >= b0) continue;
                     int ys = -1;

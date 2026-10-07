@@ -59,6 +59,7 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import admit_queue  # noqa: E402  (delta 4 / D4-7 fase 2: the admission queue and its states)
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -769,12 +770,18 @@ class StrataEngine:
         # new lists.
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
-            self.waiting = 0                            # requests waiting for the control lines (ctl)
-            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            # D4-7 fase 2: the requests waiting for the control lines, in a FIFO queue with aging (the `waiting`
+            # and `wait_lens` views below read it, so the status/metrics code and the #656 test keep working).
+            self.adm_q = admit_queue.AdmissionQueue()
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+        # D4-7 fase 2 (opt-in): STRATA_BATCH_AGENDA also drives the server - the admission queue releases the
+        # control lines while a request waits for a free slot, ages long waiters, and follows the engine's
+        # per-state BADM.  Unset/0: the server is the base tag's, byte for byte.
+        self.agenda = os.environ.get("STRATA_BATCH_AGENDA", "0").strip().lower() not in ("", "0", "false", "off")
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
+        self._adm_progress = None                       # (slot, state, read_to, total): the engine's last BADM state
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -1045,6 +1052,14 @@ class StrataEngine:
                 self._parse_done(line)
                 self._last_done = line
             elif line.startswith("BADM "):
+                prog = admit_queue.parse_progress(line)
+                if prog is not None:
+                    # D4-7 fase 2: the engine's per-state admission line (STRATA_BATCH_AGENDA only) - progress,
+                    # not the terminal BADM: publish the state and keep reading.  A server with the switch off
+                    # never sees one (the base engine emits only `BADM <slot> <0|1>`).
+                    self._adm_progress = prog
+                    yield None
+                    continue
                 f = line.split()
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
@@ -1076,6 +1091,8 @@ class StrataEngine:
                 return None
             if line.startswith("DONE"):
                 self._parse_done(line)
+            if admit_queue.parse_progress(line) is not None:
+                continue                              # the admission's own progress, never the terminal BADM
             if line.startswith(until) or line.startswith("ERR"):
                 return line
         return None
@@ -1117,15 +1134,33 @@ class StrataEngine:
         threading.Thread(target=wait, daemon=True).start()
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
+    # D4-7 fase 2 (STRATA_BATCH_AGENDA): with the switch on a long read keeps giving way to shorter waiters, and
+    # the oldest waiter is promoted past the epoch gate once it has waited AGING_S seconds (FIFO + aging).
+    YIELDS_MAX_AGENDA = 32
+    AGING_S = 2.0
+
+    @property
+    def waiting(self) -> int:
+        """Requests waiting for the control lines (a view of `adm_q`, kept for the status/metrics code)."""
+        return len(self.adm_q)
+
+    @property
+    def wait_lens(self) -> list[list]:
+        """The waiters in arrival order, `[plen, t0]` each (a long read gives way to a shorter one: `e[0]`)."""
+        return self.adm_q.lens()
+
+    def _yields_max(self) -> int:
+        """How often a prompt read may give way to a shorter waiting one (more with STRATA_BATCH_AGENDA)."""
+        return self.YIELDS_MAX_AGENDA if self.agenda else self.YIELDS_MAX
 
     def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
-        entry = [plen]
-        with self.slot_cv:
-            self.waiting += 1
-            self.wait_lens.append(entry)
+        `after_epoch`: a request whose read gave way lets the requests waiting then go first.  D4-7 fase 2: the
+        waiters live in `adm_q` (FIFO) and, with STRATA_BATCH_AGENDA on, the oldest one is promoted once it has
+        waited `AGING_S` seconds, so `after_epoch` cannot postpone it behind a stream of newcomers forever."""
+        entry = self.adm_q.join(plen, time.monotonic())
         beat = time.monotonic()
+        age_s = self.AGING_S if self.agenda else 0.0
         try:
             while True:
                 if not self.alive() and not getattr(self, "starting", False):
@@ -1133,8 +1168,10 @@ class StrataEngine:
                     # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
                     # restart is under way it keeps waiting and goes on with the new engine.
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
+                now = time.monotonic()
                 with self.slot_cv:
-                    turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+                    turn = (after_epoch is None or self.ctl_epoch > after_epoch or len(self.adm_q) <= 1
+                            or self.adm_q.is_head_and_aged(entry, now, age_s))
                 if turn and self.ctl.acquire(timeout=0.5):
                     if self.alive():
                         break
@@ -1150,9 +1187,7 @@ class StrataEngine:
                     yield None
         finally:
             with self.slot_cv:
-                self.waiting = max(0, self.waiting - 1)
-                if entry in self.wait_lens:
-                    self.wait_lens.remove(entry)
+                self.adm_q.leave(entry)
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
@@ -1216,6 +1251,7 @@ class StrataEngine:
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    self._adm_progress = None
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
@@ -1225,7 +1261,7 @@ class StrataEngine:
                             out.append(t)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
-                            if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
+                            if (reserved is None and not out and not embeddings and yields < self._yields_max() and
                                     self._shorter_waiting(len(prompt))):
                                 with self.slot_cv:          # the slot the part read will wait in
                                     reserved = self.pick_slot(prompt)
@@ -1255,7 +1291,19 @@ class StrataEngine:
                 while True:
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
-                        # the start of this prompt (its conversation's last turn), else the one used longest ago
+                        # the start of this prompt (its conversation's last turn), else the one used longest ago.
+                        # D4-7 fase 2 (STRATA_BATCH_AGENDA): a request waiting for a free slot does NOT hold the
+                        # control lines, so it cannot block every other request's admission while it waits (today
+                        # it holds them for the whole wait: one request waiting on a slot stalls them all).  The
+                        # lines are re-taken once a slot is reserved, with `after_epoch` so the other waiters go
+                        # first and the admission queue's FIFO + aging orders who gets the freed slot.
+                        slot_epoch = None
+                        released = self.agenda and holding
+                        if released:
+                            self.ctl.release()
+                            holding = False
+                            with self.slot_cv:
+                                slot_epoch = self.ctl_epoch
                         with self.slot_cv:
                             while True:
                                 slot = self.pick_slot(prompt)
@@ -1265,6 +1313,14 @@ class StrataEngine:
                                 self.slot_cv.wait(timeout=10.0)
                                 if cancel.is_set():
                                     return
+                        if released:
+                            ok = yield from self._take_control(cancel, len(prompt), after_epoch=slot_epoch)
+                            if not ok:
+                                with self.slot_cv:          # the reserved slot goes back
+                                    self.slot_busy[slot] = False
+                                    self.slot_cv.notify_all()
+                                return
+                            holding, born = True, self.gen
                     if self._yielded is not None:           # it gave way: the others waiting then go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
@@ -1287,6 +1343,7 @@ class StrataEngine:
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    self._adm_progress = None
                     asked = False
                     for x in self._control(cancel, pending.append):
                         while pending:
@@ -1294,7 +1351,7 @@ class StrataEngine:
                             out.append(t)
                             yield t
                         if x is None:
-                            if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                            if (not asked and not embeddings and yields < self._yields_max() and
                                     self._shorter_waiting(len(prompt))):
                                 self._send(f"BYIELD {slot}")
                                 asked = True

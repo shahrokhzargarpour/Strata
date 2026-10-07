@@ -94,13 +94,14 @@ placement of its own; the card **order** is what puts the head on another card.
 | `--prompt-cache-root N` | 2048 | The minimum system-prompt length (tokens) at which the first turn boundary is checkpointed as the root, in RAM. | `--serve`; the RAM prefill checkpoints. The system-prompt cache persists this root. `0` = no system-prompt checkpoint. | RAM only by itself: it does not survive a restart. The system-prompt cache is what makes the root durable. | engine 0.1.39 (upstream) |
 | `slot_save_path` (config; `--slot-save-path DIR` on the server) | empty (off) | The folder for the manual `POST /slots/0?action=save` and `?action=restore` API. A saved file is the same session format a spill writes. | The server, not the engine. Needs the model loaded, a single slot, and no `--batch`. | An explicit client action, not a cache: nothing is written unless a client asks, and nothing deletes the files. | engine 0.1.40.1 (upstream server) |
 
-## E. The continuous agenda (delta 4 / node D4-7, phase 1)
+## E. The continuous agenda (delta 4 / node D4-7, phases 1-2)
 
 Node D4-7 of the Delta-4 plan. These are **env knobs, not CLI flags**: the engine reads the environment, so a
 config for an older engine never carries an unknown argument and nothing here needs an anchor in
 `upstream.lock`. All of them are opt-in and **default off**: with `STRATA_BATCH_AGENDA` unset the read, the
 interleave and the `strata batch:` line are the base tag's, byte for byte (the pure decisions live in
-`include/strata/core/agenda.hpp` and are exercised by `tests/core/agenda_test.cpp`).
+`include/strata/core/agenda.hpp` and are exercised by `tests/core/agenda_test.cpp`; the server side lives in
+`serve/admit_queue.py` and is exercised by `serve/test_admit_queue.py` and `serve/test_parallel.py`).
 
 What it changes, in one paragraph: a prompt read while slots are decoding used to advance in full `--prefill`
 chunks (up to 8192 tokens) and, between them, run the slots' windows for a share of the **time** the chunk
@@ -110,9 +111,21 @@ by **tokens**: the decode rows are reserved first (one per active slot, two unde
 `kVerifyMaxT` = 8) and the read takes the remainder. A client that goes away is noticed every admission chunk
 instead of every full chunk, and an aging floor keeps a busy slot from starving the read.
 
+**Phase 2 (the same switch) touches the server, not only the engine.** A request waiting for a free slot used
+to hold the control lines (`self.ctl`) for the whole wait, so one request waiting on a slot stalled every other
+one; with the switch on it **releases the control lines while it waits** and re-takes them once a slot is
+reserved. The waiters live in a FIFO queue (`serve/admit_queue.py`) and the oldest one is **promoted past the
+`after_epoch` gate after `AGING_S` = 2 s**, so a long waiter cannot be deferred behind a stream of newcomers
+(FIFO + aging; the same fairness idea as llama.cpp's `--prefill-mixed-batch` round-robin patch STUDIOZ/0002,
+MIT). A long read gives way to shorter waiters up to `YIELDS_MAX_AGENDA` = 32 times (the base cap is 2). And,
+so the server can **follow the read's progress**, the engine emits a per-state admission line on the control
+stream, `BADM <slot> <state> <read_to> <total>` with `state` in `wait_slot|reading|ready|active` (a word where
+the terminal line carries 0/1); the terminal `BADM <slot> <0|1>` is unchanged, so a server that does not know
+the state lines (or an engine with the switch off) reads exactly the base protocol.
+
 | Knob | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
 | --- | --- | --- | --- | --- | --- |
-| `STRATA_BATCH_AGENDA` | unset / `0` (**off**) | Turns the continuous agenda on. With it on the admission read advances one fine chunk per turn, the decode window runs first, and the step budget is by tokens. | `--serve` with `--batch`. Inert without `--batch`, under `--batch-groups` (the pipelined path), and when a layer split has no active slot (nothing to decode-first: the read stays one pass). | It is **not** a mid-window row insert: `batch_step` is untouched and a window is rebuilt from the active slots every step (the verifier's "a window keeps every row" invariant is unmoved). It does **not** change the prompt arithmetic and does **not** raise the slot count (still `--batch 4`, rows capped at `kVerifyMaxT`). | `layer/delta4-d7` (phase 1) |
+| `STRATA_BATCH_AGENDA` | unset / `0` (**off**) | Turns the continuous agenda on - engine AND server. The read advances one fine chunk per turn, the decode window runs first, the step budget is by tokens, the server's admission queue releases the control lines while waiting for a slot and ages long waiters, and the engine emits the per-state `BADM`. | `--serve` with `--batch`. Inert without `--batch`, under `--batch-groups` (the pipelined path), and when a layer split has no active slot (nothing to decode-first: the read stays one pass). The server side is inert without `--batch` (there are no slots to wait for). | It is **not** a mid-window row insert: `batch_step` is untouched and a window is rebuilt from the active slots every step (the verifier's "a window keeps every row" invariant is unmoved). It does **not** change the prompt arithmetic and does **not** raise the slot count (still `--batch 4`, rows capped at `kVerifyMaxT`). The server still serves **one admission at a time** (the control stream is not slot-demultiplexed): the switch removes the head-of-line block of a request *waiting for a slot*, not the serialization of two prompt reads. | `layer/delta4-d7` (phases 1-2) |
 | `STRATA_BATCH_AGENDA_CHUNK` | `512` | The admission chunk `C_adm`: the read advances this many tokens per turn, so `should_stop` is honoured every `C_adm` tokens (down from the full `--prefill` chunk). | With `STRATA_BATCH_AGENDA` on. `0` keeps the full chunk (the base granularity). | A granularity, not a budget: it does not change what the model reads, only how often the read yields. It is applied to the read's chunking; the chunks still partition the same prompt. | `layer/delta4-d7` (phase 1) |
 | `STRATA_BATCH_AGENDA_BUDGET` | `520` = `C_adm` + `kVerifyMaxT` | The per-step **token** budget: the decode rows are reserved first and the read gets the remainder. Replaces the time share when the agenda is on. | With `STRATA_BATCH_AGENDA` on and `STRATA_BATCH_DECODE_SHARE` **not** set. | A token budget, not a time share. At the default it never binds (the read keeps its full chunk); a value at or below the decode rows makes the read rely on the aging floor. | `layer/delta4-d7` (phase 1) |
 | `STRATA_BATCH_AGENDA_AGE` | `4` | The aging threshold: after this many consecutive turns with no read advance, the read is granted its full admission chunk and that turn's window is skipped. | With `STRATA_BATCH_AGENDA` on. `0` disables the aging *grant* (a 1-token floor still keeps the loop live). | A **floor of progress**, not a scheduler: it bounds a starvation the token budget could cause; it does not change the window's composition. | `layer/delta4-d7` (phase 1) |

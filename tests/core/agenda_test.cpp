@@ -173,6 +173,17 @@ int main() {
               "no active slot, no budget: the read is one whole chunk with no window == today");
     }
 
+    // ── The state names on the wire (D4-7 fase 2) ────────────────────────────────────────────────────────────
+    //
+    // The engine's per-state admission line is `BADM <slot> <state> <read_to> <total>`, and the server's parser
+    // (serve/admit_queue.py:parse_progress) accepts exactly the four words below.  A rename on either side shows
+    // up here instead of silently turning a state line into a terminal one (the terminal line is numeric).
+    std::printf("agenda: the admission state names on the wire (the server's parser reads these)\n");
+    check(std::string(adm_state_name(AdmState::WaitSlot)) == "wait_slot", "WAIT_SLOT -> \"wait_slot\"");
+    check(std::string(adm_state_name(AdmState::Reading)) == "reading", "READING -> \"reading\"");
+    check(std::string(adm_state_name(AdmState::Ready)) == "ready", "READY -> \"ready\"");
+    check(std::string(adm_state_name(AdmState::Active)) == "active", "ACTIVE -> \"active\"");
+
     std::printf("agenda: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
