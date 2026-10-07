@@ -93,3 +93,27 @@ placement of its own; the card **order** is what puts the head on another card.
 | `--kv-resident N` | 0 / setup | Where the context's K/V lives: keep N cells of each QSA layer in VRAM and the rest in host RAM (KV streaming, minimum 20480). | `--serve`; the KV cache, not any conversation cache. | **Not a cache and not part of this layer.** It changes the per-turn read cost and VRAM residency; the disk tier does not. | engine 0.1.5 (upstream) |
 | `--prompt-cache-root N` | 2048 | The minimum system-prompt length (tokens) at which the first turn boundary is checkpointed as the root, in RAM. | `--serve`; the RAM prefill checkpoints. The system-prompt cache persists this root. `0` = no system-prompt checkpoint. | RAM only by itself: it does not survive a restart. The system-prompt cache is what makes the root durable. | engine 0.1.39 (upstream) |
 | `slot_save_path` (config; `--slot-save-path DIR` on the server) | empty (off) | The folder for the manual `POST /slots/0?action=save` and `?action=restore` API. A saved file is the same session format a spill writes. | The server, not the engine. Needs the model loaded, a single slot, and no `--batch`. | An explicit client action, not a cache: nothing is written unless a client asks, and nothing deletes the files. | engine 0.1.40.1 (upstream server) |
+
+## E. The continuous agenda (delta 4 / node D4-7, phase 1)
+
+Node D4-7 of the Delta-4 plan. These are **env knobs, not CLI flags**: the engine reads the environment, so a
+config for an older engine never carries an unknown argument and nothing here needs an anchor in
+`upstream.lock`. All of them are opt-in and **default off**: with `STRATA_BATCH_AGENDA` unset the read, the
+interleave and the `strata batch:` line are the base tag's, byte for byte (the pure decisions live in
+`include/strata/core/agenda.hpp` and are exercised by `tests/core/agenda_test.cpp`).
+
+What it changes, in one paragraph: a prompt read while slots are decoding used to advance in full `--prefill`
+chunks (up to 8192 tokens) and, between them, run the slots' windows for a share of the **time** the chunk
+took (`STRATA_BATCH_DECODE_SHARE`, a fraction of wall time, default 0.5). With the agenda on, the read advances
+one **fine** chunk per turn, the decode window of the active slots goes **first**, and the per-step budget is
+by **tokens**: the decode rows are reserved first (one per active slot, two under `--batch-mtp`, capped at
+`kVerifyMaxT` = 8) and the read takes the remainder. A client that goes away is noticed every admission chunk
+instead of every full chunk, and an aging floor keeps a busy slot from starving the read.
+
+| Knob | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
+| --- | --- | --- | --- | --- | --- |
+| `STRATA_BATCH_AGENDA` | unset / `0` (**off**) | Turns the continuous agenda on. With it on the admission read advances one fine chunk per turn, the decode window runs first, and the step budget is by tokens. | `--serve` with `--batch`. Inert without `--batch`, under `--batch-groups` (the pipelined path), and when a layer split has no active slot (nothing to decode-first: the read stays one pass). | It is **not** a mid-window row insert: `batch_step` is untouched and a window is rebuilt from the active slots every step (the verifier's "a window keeps every row" invariant is unmoved). It does **not** change the prompt arithmetic and does **not** raise the slot count (still `--batch 4`, rows capped at `kVerifyMaxT`). | `layer/delta4-d7` (phase 1) |
+| `STRATA_BATCH_AGENDA_CHUNK` | `512` | The admission chunk `C_adm`: the read advances this many tokens per turn, so `should_stop` is honoured every `C_adm` tokens (down from the full `--prefill` chunk). | With `STRATA_BATCH_AGENDA` on. `0` keeps the full chunk (the base granularity). | A granularity, not a budget: it does not change what the model reads, only how often the read yields. It is applied to the read's chunking; the chunks still partition the same prompt. | `layer/delta4-d7` (phase 1) |
+| `STRATA_BATCH_AGENDA_BUDGET` | `520` = `C_adm` + `kVerifyMaxT` | The per-step **token** budget: the decode rows are reserved first and the read gets the remainder. Replaces the time share when the agenda is on. | With `STRATA_BATCH_AGENDA` on and `STRATA_BATCH_DECODE_SHARE` **not** set. | A token budget, not a time share. At the default it never binds (the read keeps its full chunk); a value at or below the decode rows makes the read rely on the aging floor. | `layer/delta4-d7` (phase 1) |
+| `STRATA_BATCH_AGENDA_AGE` | `4` | The aging threshold: after this many consecutive turns with no read advance, the read is granted its full admission chunk and that turn's window is skipped. | With `STRATA_BATCH_AGENDA` on. `0` disables the aging *grant* (a 1-token floor still keeps the loop live). | A **floor of progress**, not a scheduler: it bounds a starvation the token budget could cause; it does not change the window's composition. | `layer/delta4-d7` (phase 1) |
+| `STRATA_BATCH_DECODE_SHARE` (existing) | `0.5` | Unchanged. When it is **set explicitly**, the engine keeps the base tag's time-share reparto **even with the agenda on** (the compatibility path the plan asks for). | `--serve`. With it set, `STRATA_BATCH_AGENDA_BUDGET` does not apply. | Still a fraction of the chunk's wall time, applied between chunks - it is not a token budget. | `layer/base` (unchanged) |
