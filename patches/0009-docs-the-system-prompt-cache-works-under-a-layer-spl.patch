@@ -1,7 +1,7 @@
 From e8efacd0a7b0eb222c597fd43e6790860fd8f795 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 22:26:04 -0600
-Subject: [PATCH 09/11] docs: the system-prompt cache works under a layer split
+Subject: [PATCH 09/12] docs: the system-prompt cache works under a layer split
  too
 
 FLAGS.md, DETAILS.md and SPILL_AND_PROMPT_CACHE.md still said the function runs

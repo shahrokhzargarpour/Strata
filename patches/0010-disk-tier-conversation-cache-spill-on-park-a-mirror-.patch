@@ -1,7 +1,7 @@
 From bea20c98d20dc68d23b81d006ad52372636b7ed5 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Wed, 7 Oct 2026 00:18:13 -0600
-Subject: [PATCH 10/11] disk tier: --conversation-cache-spill-on park (a mirror
+Subject: [PATCH 10/12] disk tier: --conversation-cache-spill-on park (a mirror
  at the park), compaction and cancellation
 
 The disk tier stops being only overflow. With the tier on, --conversation-cache-spill-on defaults to park: the state the request ends with (the park) is written then, by an async writer that keeps one cell per conversation holding only the newest state, so a turn with five tool calls writes once. evict is the opt-out and reproduces delta 1 byte for byte; without a spill directory both are inert.

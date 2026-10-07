@@ -62,7 +62,12 @@
     { "id": "A17", "archivo": "tests/core/stage_plan_test.cpp", "patron": "head_stage_of", "que_protege": "delta 3: el test host-only que fija las dos decisiones" },
     { "id": "A18", "archivo": "CMakeLists.txt", "patron": "stage_plan_test", "que_protege": "delta 3: el test esta registrado en el build" },
     { "id": "A19", "archivo": "serve/server.py", "patron": "ordered_gpus", "que_protege": "delta 3: el orden de tarjetas (CUDA_VISIBLE_DEVICES) pone al head en la tarjeta elegida" },
-    { "id": "A20", "archivo": "tools/test_setup_head_device.py", "patron": "head_card_by_time", "que_protege": "delta 3: el test host-only del ranking por tiempo del instalador (mas VRAM no gana el head)" }
+    { "id": "A20", "archivo": "tools/test_setup_head_device.py", "patron": "head_card_by_time", "que_protege": "delta 3: el test host-only del ranking por tiempo del instalador (mas VRAM no gana el head)" },
+    { "id": "A21", "archivo": "include/strata/core/stage_plan.hpp", "patron": "draft_head_type", "que_protege": "delta 3: el tipo del draft head NUNCA queda en -1 en un drafter de slot (el defecto que mataba el motor)" },
+    { "id": "A22", "archivo": "src/core/mtp.cpp", "patron": "dhead_type_ = strata::core::draft_head_type", "que_protege": "delta 3: bind() USA esa resolucion al compartir el draft head con los slots" },
+    { "id": "A23", "archivo": "src/core/mtp.cpp", "patron": "slot_mtp_reason", "que_protege": "delta 3: el drafter RECHAZA en bind un tipo sin camino MMVQ nativo (arranque, no mitad de admision)" },
+    { "id": "A24", "archivo": "src/program/generate.cpp", "patron": "disable_batch_mtp", "que_protege": "delta 3: fail-open - un drafter de slot o un draft que falla APAGA el flag, nunca termina el proceso" },
+    { "id": "A25", "archivo": "tests/core/stage_plan_test.cpp", "patron": "draft_head_type", "que_protege": "delta 3: el test de regresion del defecto (62 checks)" }
   ],
   "invariantes": [
     "Con los flags ausentes: paridad de tokens con upstream (inerte).",
@@ -77,7 +82,9 @@
     "Una copia cuyo encabezado coincide con el prompt entrante pero cuyo prefijo comun es menor a --conversation-cache-spill-divergence-tokens se descarta (compactacion); una de encabezado distinto es otra conversacion y no se toca.",
     "Delta 3: sin --head-device (-1) el orden de dispositivos es EXACTAMENTE el que arma --layer-split/--split-device: la capa es inerte.",
     "Delta 3: sin --batch-mtp el camino de batch es el de upstream (la elegibilidad solo se consulta con el flag encendido).",
-    "Delta 3: con una sola GPU bslot_ss.size() == 1 y el indice de etapa del drafter de slot es 0, como siempre."
+    "Delta 3: con una sola GPU bslot_ss.size() == 1 y el indice de etapa del drafter de slot es 0, como siempre.",
+    "Delta 3 (fail-open): --batch-mtp NUNCA termina el proceso. Si un drafter de slot no se puede construir, o si su tipo de draft head no tiene camino MMVQ nativo, o si un draft falla en runtime, el flag se apaga con el motivo en el log y los slots siguen decodificando sin drafts.",
+    "Delta 3 (defecto de upstream, arreglado aqui): un drafter de slot COMPARTE el draft head del drafter principal (dhead_/dvocab_) y debe compartir su FORMATO. En la base, dhead_type_ quedaba en -1 y native_mmvq(-1, ...) lanzaba 'unsupported native MMVQ GGML type' en la primera admision; el motor salia con exit 1."
   ],
   "no_afirmaciones": [
     "La atencion es causal: no se puede conservar la cola de una conversacion bajo un system prompt distinto.",
@@ -87,6 +94,8 @@
     "Delta 3: --head-device no es un cambio de reparto de capas: los puntos del split no se mueven, solo que etapa corre el head.",
     "Delta 3: --head-device no es una afirmacion de velocidad: la estimacion por tiempo del instalador es un modelo (SMs x reloj), no una medicion.",
     "Delta 3: --batch-mtp con layer split NO fue medido en esta maquina (ambas GPUs ocupadas por produccion): el motor arranca y sirve, pero el tok/s y los drafts aceptados bajo split quedan sin medir.",
-    "Delta 3: la verificacion bit a bit del hand-off con batches y split exige 2 GPUs libres y NO se corrio."
+    "Delta 3: la verificacion bit a bit del hand-off con batches y split exige 2 GPUs libres y NO se corrio.",
+    "Delta 3: el ARREGLO del tipo del draft head esta cubierto host-only (draft_head_type + slot_mtp_reason en stage_plan_test) pero NO se verifico en vivo con el modelo: las dos GPUs las ocupa produccion (:5011) y :5012 no tiene listener. El binario arreglado se probo solo hasta compilar y pasar la bateria host-only.",
+    "Delta 3: el defecto del tipo es de UPSTREAM (src/core/mtp.cpp no lo toca esta capa y v0.1.40.1/main tienen la misma omision en el bloque `shared != nullptr` de bind()); nuestro arreglo de una linea y el guard de arranque son un delta propio, y el aporte al upstream es que su --batch-mtp en UNA GPU falla igual cuando el rt trae draft_vocab.bin."
   ]
 }

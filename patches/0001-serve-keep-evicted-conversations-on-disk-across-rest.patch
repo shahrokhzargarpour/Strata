@@ -1,7 +1,7 @@
 From 5f28241c7803580d97b268ffa3eab4d750487f6e Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?An=C3=ADbal=20Mu=C3=B1oz=20Calero?= <anbal.mc@hotmail.com>
 Date: Tue, 6 Oct 2026 20:36:30 +0200
-Subject: [PATCH 01/11] serve: keep evicted conversations on disk across
+Subject: [PATCH 01/12] serve: keep evicted conversations on disk across
  restarts
 
 The RAM conversation cache drops a parked conversation when RAM pressure or
