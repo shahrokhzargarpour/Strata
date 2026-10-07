@@ -1,7 +1,7 @@
 From 8a01693f4fb12aed494f3d7c539d076e7d6f8d33 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 20:14:33 -0600
-Subject: [PATCH 05/13] system-prompt prefill cache (--system-prompt-cache*):
+Subject: [PATCH 05/14] system-prompt prefill cache (--system-prompt-cache*):
  persist the prompt-cache root as a session file
 
 The checkpoint root that ends the system prompt, which lived only in RAM (--prompt-cache-root), is now persisted as an ordinary session file (the same format and identity as the slot save/restore API) in --system-prompt-cache-dir and reloaded at start, so a new chat of the same client reads only the tokens after it. A variant is keyed by the hash of the exact system-prompt token prefix + the optional declared key + the model/config identity, so attention's causality is never violated: a stored tail can never ride behind a different system prompt. A changed prefix is a miss, is reprocessed and rewritten (hash_changes counter + log), and the old variant stays until the GC (count/size/age, oldest first). Inert unless --system-prompt-cache. Also wires the F4 --conversation-cache-spill-when-full / -max-age-days flags into the CLI. conversation_prompt_cache_test: 52 checks.

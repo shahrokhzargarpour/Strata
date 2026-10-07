@@ -1,7 +1,7 @@
 From 31c12e56c6b6c772f727af8ab31685e48a934d20 Mon Sep 17 00:00:00 2001
 From: Strata layer <layer@studioz.local>
 Date: Wed, 7 Oct 2026 01:20:38 -0600
-Subject: [PATCH 11/13] layer split: --batch-mtp across the stages, and
+Subject: [PATCH 11/14] layer split: --batch-mtp across the stages, and
  --head-device picks the head's card
 
 --batch-mtp ran on one GPU only, because a slot's draft state could not be reasoned about across a stage

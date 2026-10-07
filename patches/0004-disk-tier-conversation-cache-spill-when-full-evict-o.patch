@@ -1,7 +1,7 @@
 From fe38fbd5755acc75ffb296b9a1fad323ce32eb01 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 20:14:23 -0600
-Subject: [PATCH 04/13] disk tier: --conversation-cache-spill-when-full
+Subject: [PATCH 04/14] disk tier: --conversation-cache-spill-when-full
  (evict-oldest|reject) and --conversation-cache-spill-max-age-days (0 = off)
 
 The GC's budget lever is now explicit: evict-oldest is the old behavior made a mode, reject refuses a spill over the budget and removes nothing. A separate age lever prunes conversations older than N days, oldest first, and is off by default (0 = no deletion by time at all). The scan still deletes nothing. conversation_spill_test: 102 checks.

@@ -1,0 +1,323 @@
+From 228f7f6827024e66c0dc28268dc326fe30cafb3c Mon Sep 17 00:00:00 2001
+From: Shahrokh <design@cariblanco.best>
+Date: Wed, 7 Oct 2026 04:41:48 -0600
+Subject: [PATCH 14/14] layer split: measure --batch-mtp's acceptance (the
+ batch path never reported it)
+
+The admitted request printed DONE ... 0 of 0 (it decoded one token) and the per-window decisions lived in batch_step, unreported.  A pure DraftAccept accumulator (stage_plan.hpp, host-tested) now counts one proposal per active slot per window: the target picked it when the window's two rows of that slot agree.  Each slot's BDONE ends with accepted, offered (appended, so an older reader is unaffected); the strata batch: summary reports the period's rate, absent without the flag.
+---
+ docs/BATCHING.md                   |  9 ++++++-
+ docs/FLAGS.md                      |  2 +-
+ include/strata/core/stage_plan.hpp | 14 ++++++++++
+ serve/server.py                    | 24 +++++++++++++++--
+ serve/test_parallel.py             | 31 ++++++++++++++++++++--
+ src/program/generate.cpp           | 42 ++++++++++++++++++++++++++----
+ tests/core/stage_plan_test.cpp     | 30 +++++++++++++++++++++
+ 7 files changed, 141 insertions(+), 11 deletions(-)
+
+diff --git a/docs/BATCHING.md b/docs/BATCHING.md
+index 82a4e49..2e02e2f 100644
+--- a/docs/BATCHING.md
++++ b/docs/BATCHING.md
+@@ -230,7 +230,7 @@ On top of `GEN` / `GENI`:
+ | `BGENI <slot> <max_new> [keys] <file> <ids>` | in | the same with images |
+ | `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended |
+ | `BT <slot> <id>` | out | a token of that slot |
+-| `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again (it keeps its conversation) |
++| `BDONE <slot> <generated> <stop/length/cancel> <ms> [accepted] [offered]` | out | the slot is free again (it keeps its conversation). With `--batch-mtp` the last two fields are that slot's own MTP acceptance for the request that just ended (proposals the target picked of those verified); without the flag, or in the `--batch-groups` pipeline (which does not draft), they are absent. |
+ | `BSTOP <slot>` | in | end that slot at its next window |
+ | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
+ | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
+@@ -238,3 +238,10 @@ On top of `GEN` / `GENI`:
+ 
+ `tools/batch_test.py` drives the engine directly: the same prompts alone, then together, compared token by token,
+ and the aggregate rate.
++
++When the slots go idle the engine writes its own summary to stderr, **once per busy period** - the one the Monitor
++reads (`strata batch: <windows> windows, avg <rows> rows, ...`). With `--batch-mtp` it ends with the period's MTP
++acceptance: `; MTP drafts accepted A of O (P%)`, the proposals the target picked of those the slots verified (one per
++active slot per window). Without the flag the clause is absent, so the line is the base tag's. The request that
++admitted a slot still prints its own `DONE ... drafts accepted 0 of 0` (it decoded one token): its acceptance is what
++its `BDONE` carries, and what the summary adds up.
+diff --git a/docs/FLAGS.md b/docs/FLAGS.md
+index 96f3c19..a0f2fa6 100644
+--- a/docs/FLAGS.md
++++ b/docs/FLAGS.md
+@@ -81,7 +81,7 @@ placement of its own; the card **order** is what puts the head on another card.
+ | --- | --- | --- | --- | --- | --- |
+ | `--head-device D` (env `STRATA_HEAD_DEVICE`) | `-1` (as placed: the last stage) | The device that runs the output head **and**, with it, the MTP draft layer (the drafter reads the last stage's residual, so the two move together). It names one of the devices the pipeline already uses (`0` is the primary, the rest are `--split-device`): the later stages are reordered so that one is last. | `--serve` with a layer split. With one card it is a no-op (`D` must be `0`). A device that is not one of the pipeline's, or the primary device of a split, is **said and ignored** - the head stays where it was. | It is **not** a layer placement: the split points do not move, only which stage owns the head. It cannot move the head onto the primary device of a split (device 0 runs the first stage and the prompt path; a head-only tail stage is not implemented) - order the cards instead (below). It is **not** a speed claim: nothing measures anything here. | `layer/delta3` |
+ | `"head_device": N` (config; the server reads it, not the engine) | absent | The card, numbered as `nvidia-smi` numbers them, that must hold the head. The server lists it **last** in `CUDA_VISIBLE_DEVICES`, so the engine's last stage - the head's - is that card. | The server's config (`strata-*.json`), or `setup --head-device N|auto`. Needs two or more cards in `"gpu"`; a card that is not one of them is refused. | It reorders the cards, so an **explicit** `"layer_split"` keeps its meaning *in the new order* ("24" is still "the second card starts at layer 24", but the second card is a different card). No engine flag is involved: an older engine understands it. | `layer/delta3` |
+-| `--batch-mtp` (env `STRATA_BATCH_MTP=1`) | off | With `--batch N` and the MTP drafter (`--mtp`, `--spec T`), each batch slot also verifies **one** MTP proposal per window. | `--serve`, `--batch 2+`, `--mtp`, `--spec T >= 2`. **A layer split works too (delta 3)**: every stage keeps its own session per slot and the slot drafters live on the last stage's device. Not with `--split-device 0` (both stages on one GPU: the batch slots themselves need a card per stage). Anything else the engine says in one line (`WARNING: --batch-mtp is off: ...`) and batches as usual. | The VRAM it costs is per slot: the drafter's K/V and buffers, on the head's card. Upstream measured +31 % to +39 % total throughput on an RTX PRO 5000 with 2-4 clients **on one GPU**; this tree has **not** measured it under a layer split (docs/BATCHING.md says so). One proposal per slot: more drafts accepted per window is not what this does. **A flag never ends the engine**: if a slot's drafter cannot be built, or the draft head's GGML type has no native MMVQ path, or a draft fails while serving, the engine says `WARNING: --batch-mtp is off: <reason>` and the slots go on decoding **without drafts** (the request is served). | `engine 0.1.39` (upstream); the layer split with it, and the fail-open, are `layer/delta3` |
++| `--batch-mtp` (env `STRATA_BATCH_MTP=1`) | off | With `--batch N` and the MTP drafter (`--mtp`, `--spec T`), each batch slot also verifies **one** MTP proposal per window. | `--serve`, `--batch 2+`, `--mtp`, `--spec T >= 2`. **A layer split works too (delta 3)**: every stage keeps its own session per slot and the slot drafters live on the last stage's device. Not with `--split-device 0` (both stages on one GPU: the batch slots themselves need a card per stage). Anything else the engine says in one line (`WARNING: --batch-mtp is off: ...`) and batches as usual. | The VRAM it costs is per slot: the drafter's K/V and buffers, on the head's card. Upstream measured +31 % to +39 % total throughput on an RTX PRO 5000 with 2-4 clients **on one GPU**; this tree has **not** measured it under a layer split (docs/BATCHING.md says so). One proposal per slot: more drafts accepted per window is not what this does. The acceptance is **reported** (delta 3's measurement): each slot's `BDONE` ends with `accepted offered`, and the `strata batch:` summary line carries the period's `MTP drafts accepted A of O (P%)` - absent without the flag. **A flag never ends the engine**: if a slot's drafter cannot be built, or the draft head's GGML type has no native MMVQ path, or a draft fails while serving, the engine says `WARNING: --batch-mtp is off: <reason>` and the slots go on decoding **without drafts** (the request is served). | `engine 0.1.39` (upstream); the layer split with it, and the fail-open, are `layer/delta3` |
+ 
+ ## D. Upstream flags these are confused with
+ 
+diff --git a/include/strata/core/stage_plan.hpp b/include/strata/core/stage_plan.hpp
+index 2ca696e..01b6e71 100644
+--- a/include/strata/core/stage_plan.hpp
++++ b/include/strata/core/stage_plan.hpp
+@@ -70,6 +70,20 @@ inline bool batch_rows_fit_handoff(int hbase, int S, int max_rows) {
+     return hbase >= 0 && S >= 1 && hbase + S <= max_rows;
+ }
+ 
++// ── The MTP acceptance of a batch period (delta 3's measurement) ───────────────────────────────────────────────
++//
++// --batch-mtp verifies ONE proposal per active slot per window.  The proposal is ACCEPTED when the target itself
++// picked it: the window's two rows of that slot agree (the confirmed token and the draft).  The batch path had no
++// counter for this: the request that admitted the slot prints its own `DONE ... 0 0` (it decoded one token) and the
++// per-window decisions live in `batch_step`.  This is the tiny accumulator both the per-slot `BDONE` and the
++// `strata batch:` summary report from - a plain struct, so the printed rate is a rule the host test asserts.
++struct DraftAccept {
++    long long offered = 0;   ///< proposals verified (one per active slot per window under --batch-mtp)
++    long long accepted = 0;  ///< proposals the target picked
++    void observe(bool hit) { ++offered; if (hit) ++accepted; }
++    double rate() const { return offered > 0 ? (double) accepted / (double) offered : 0.0; }
++};
++
+ // ── The draft head's GGML type, and the reason --batch-mtp stays off when the drafters cannot run ──────────────
+ //
+ // A batch slot's drafter does not build the draft head's token subset: it COPIES the main drafter's (`dhead_`,
+diff --git a/serve/server.py b/serve/server.py
+index d54ab1d..c68d325 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1345,8 +1345,13 @@ class StrataEngine:
+                         phase = "none"
+                         f = line.split()
+                         if len(f) >= 5 and isinstance(self.last, dict):
+-                            self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
+-                                         "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
++                            # fields 5 and 6 (delta 3's --batch-mtp): the slot's own MTP acceptance for the
++                            # request that just ended (accepted, offered).  Appended, so an engine without the
++                            # fields (or the pipelined path, which does not draft) leaves the DONE's numbers.
++                            upd = {"finish": f[3], "decode_ms": float(f[4]),
++                                   "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
++                            upd.update(bdone_drafts(f))
++                            self.last = {**self.last, **upd}
+                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
+                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
+@@ -3328,6 +3333,21 @@ class Service:
+         yield "done", done
+ 
+ 
++def bdone_drafts(f: list[str]) -> dict:
++    """delta 3 (`--batch-mtp`): the MTP acceptance an engine appends to its `BDONE` line, as fields 5 and 6
++    (`BDONE <slot> <generated> <stop/length/cancel> <ms> <accepted> <offered>`).  A request that admitted a slot
++    prints its own `DONE ... 0 of 0` (it decoded one token), so the slot's acceptance is only on the `BDONE`.
++    -> {"drafts_accepted": ..., "drafts_offered": ...}, or {} for an engine without the fields (an older engine,
++    or the `--batch-groups` pipeline, which does not draft).  Appended after <ms>, so the first five fields are
++    read exactly as before."""
++    if len(f) >= 7:
++        try:
++            return {"drafts_accepted": int(f[5]), "drafts_offered": int(f[6])}
++        except ValueError:
++            return {}
++    return {}
++
++
+ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
+     """#471: the prompt tokens a request got through - all of them, unless the engine's DONE line says a cancel stopped
+     its prompt read part-way (then the reused ones plus those read).  /metrics' history and totals count these, so a
+diff --git a/serve/test_parallel.py b/serve/test_parallel.py
+index ed935ba..0370104 100644
+--- a/serve/test_parallel.py
++++ b/serve/test_parallel.py
+@@ -16,7 +16,7 @@ from pathlib import Path
+ from unittest import mock
+ 
+ from serve.frontend import ChatTemplate
+-from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
++from serve.server import ByteTokenizer, Service, StrataEngine, bdone_drafts, engine_args, parallel_args, serve
+ 
+ # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
+ # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
+@@ -62,7 +62,9 @@ def window():        # one batch window: every active slot one token
+         if t == 257 or produced >= max_new:
+             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
+             stopped.discard(b)
+-            print(f"BDONE {b} {produced} {fin} 1.0", flush=True)
++            # delta 3 (--batch-mtp): the slot's own MTP proposals, appended after <ms> (accepted, offered).  An
++            # engine without the flag, or the pipelined path, omits them; the server reads them when present.
++            print(f"BDONE {b} {produced} {fin} 1.0 1 3", flush=True)
+             del active[b]
+         else:
+             active[b] = [left, max_new, produced]
+@@ -145,6 +147,31 @@ while True:
+ '''
+ 
+ 
++class BdoneDrafts(unittest.TestCase):
++    """delta 3 (`--batch-mtp`): the slot's own MTP acceptance, appended to the `BDONE` line after <ms> (accepted,
++    offered).  The engine's per-window decisions are only reported there (the admitted request's own `DONE` says
++    `0 of 0`: it decoded one token), so the parser must read the suffix AND tolerate its absence (an older engine,
++    or the `--batch-groups` pipeline, which does not draft)."""
++
++    def test_the_suffix_is_read(self):
++        f = "BDONE 2 37 length 812.5 11 23".split()
++        self.assertEqual(bdone_drafts(f), {"drafts_accepted": 11, "drafts_offered": 23})
++
++    def test_all_details_are_read(self):
++        for fin in ("stop", "length", "cancel"):
++            self.assertEqual(bdone_drafts(f"BDONE 0 1 {fin} 1.0 0 1".split()),
++                             {"drafts_accepted": 0, "drafts_offered": 1})
++
++    def test_no_fields_is_empty(self):
++        # an engine without the flag (or the pipelined path): the first five fields only -> nothing to add
++        self.assertEqual(bdone_drafts("BDONE 1 12 stop 1.0".split()), {})
++        self.assertEqual(bdone_drafts("BDONE 1 0 error 0".split()), {})
++
++    def test_a_non_numeric_suffix_is_ignored(self):
++        # an engine's own trailing text must never crash the parser or invent numbers
++        self.assertEqual(bdone_drafts("BDONE 0 5 stop 1.0 n/a x".split()), {})
++
++
+ class ParallelArgs(unittest.TestCase):
+     def test_parallel_config_key(self):
+         self.assertEqual(parallel_args({"parallel": 4}, []), ["--batch", "4"])
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 61cdd9c..6ae32e3 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7762,6 +7762,10 @@ int main(int argc, char** argv) {
+             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
+             std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
+             bool draft_ready = false;
++            // DELTA 3 (measure it): the proposals this slot verified for THIS request, and the ones the target
++            // picked (one per window under --batch-mtp).  Reset with the slot's other fields at its admission,
++            // printed on its BDONE so a request's acceptance is readable per slot.
++            strata::core::DraftAccept drafts;
+             int64_t p = 0;                 ///< its position
+             int64_t produced = 0, max_new = 0;
+             Clock::time_point t0;
+@@ -7786,6 +7790,11 @@ int main(int argc, char** argv) {
+         double bt_wait0 = 0, bt_pool0 = 0;
+         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
+         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0;
++        // DELTA 3 (measure it): the MTP proposals the batch windows verified since the slots were last all idle,
++        // and the ones the target picked.  Reported once per busy period in the `strata batch:` summary line (the
++        // one the Monitor reads), then reset with bt_windows.  Always 0 without --batch-mtp, so the line is the
++        // base tag's to the byte.
++        strata::core::DraftAccept bt_drafts;
+         Clock::time_point bt_start = Clock::now();
+         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
+         long long admit_max_new = 0;
+@@ -7943,10 +7952,20 @@ int main(int argc, char** argv) {
+             std::vector<int> keep(bs.size(), 0);
+             for (int a = 0; a < A; ++a) {
+                 const int b = active[a], i = first[a];
+-                const BSlot& sl = bs[(size_t) b];
++                BSlot& sl = bs[(size_t) b];
+                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
+-                keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
++                // the proposal was picked when the target's own row agrees with the drafted one (tok[i + 1])
++                const bool draft_hit = batch_mtp && outb[i] == tok[i + 1];
++                keep[b] = draft_hit && !eos && !sl.stop &&
+                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
++                // DELTA 3 (measure it): count what this window verified.  The admitted request printed its own
++                // `DONE ... 0 of 0` (it decoded one token); the proposals are verified HERE, one per active slot
++                // per window, and were never reported.  The rate is the target's own pick, independent of the room
++                // and stop checks that only decide whether the second row is EMITTED.
++                if (batch_mtp) {
++                    sl.drafts.observe(draft_hit);
++                    bt_drafts.observe(draft_hit);
++                }
+             }
+             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
+                 std::printf("ERR %s\n", err.c_str());
+@@ -7971,7 +7990,11 @@ int main(int argc, char** argv) {
+                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
+                     if (fin != nullptr) {
+                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
++                        // DELTA 3 (measure it): the fields after <ms> are this slot's own MTP acceptance for the
++                        // request that just ended (accepted, offered).  Appended, so an older server reads the
++                        // first five fields as it always did.
++                        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin, ms,
++                                    (long long) sl.drafts.accepted, (long long) sl.drafts.offered);
+                         sl.active = false;
+                         sl.cached = o.prompt_cache > 0 && !sl.img;
+                         break;
+@@ -8008,20 +8031,29 @@ int main(int argc, char** argv) {
+             if (!batch_on() && bt_windows > 0) {
+                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
+                 const double L = (double) g.n_layers;
++                // DELTA 3 (measure it): the MTP acceptance of this busy period, said beside the window timings.
++                // Empty without --batch-mtp (no proposal was offered), so the line is the base tag's to the byte.
++                char mtp_txt[96] = "";
++                if (bt_drafts.offered > 0)
++                    std::snprintf(mtp_txt, sizeof(mtp_txt), "; MTP drafts accepted %lld of %lld (%.1f%%)",
++                                  (long long) bt_drafts.accepted, (long long) bt_drafts.offered,
++                                  100.0 * bt_drafts.rate());
+                 std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (CUDA0 GPU-reach "
+                                      "wait %.2f + CPU experts %.2f) + commit %.2f + emit %.2f; per layer-window: CPU experts "
+                                      "%.2f, VRAM hits %.2f, PCIe %.2f; %.1f rows/s over %.0f ms of wall time (admissions "
+-                                     "included)\n",
++                                     "included)%s\n",
+                              (long long) bt_windows, bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
+                              (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
+                              (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
+-                             (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
++                             (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall,
++                             mtp_txt);
+                 for (size_t k = 0; k <= stages.size(); ++k) {
+                     const std::string pr = (k == 0 ? ver : stages[k - 1]->ver).profile_report();
+                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %zu (ms/window):%s\n", k + 1, pr.c_str());
+                 }
+                 bt_run = bt_commit = bt_emit = 0;
+                 bt_windows = bt_rows = bt_tokens = 0;
++                bt_drafts = strata::core::DraftAccept{};   // a new busy period starts clean
+             }
+             return true;
+         };
+diff --git a/tests/core/stage_plan_test.cpp b/tests/core/stage_plan_test.cpp
+index 9374e84..b0e5aa0 100644
+--- a/tests/core/stage_plan_test.cpp
++++ b/tests/core/stage_plan_test.cpp
+@@ -20,6 +20,7 @@
+ 
+ using strata::core::batch_mtp_reason;
+ using strata::core::batch_rows_fit_handoff;
++using strata::core::DraftAccept;
+ using strata::core::draft_head_type;
+ using strata::core::head_stage_of;
+ using strata::core::order_with_head_device;
+@@ -103,6 +104,35 @@ int main() {
+     check(!batch_rows_fit_handoff(-1, 2, 8), "a negative base: refused");
+     check(!batch_rows_fit_handoff(0, 0, 8), "an empty window: refused");
+ 
++    // ── The MTP acceptance of a batch period (delta 3's measurement) ───────────────────────────────────────────
++    //
++    // --batch-mtp verifies one proposal per active slot per window; it is accepted when the target picked it (the
++    // two rows of that slot agree).  Before this the batch path reported nothing: the admitted request's DONE said
++    // `drafts accepted 0 of 0` and the window decisions were never accumulated.  `DraftAccept` is what the per-slot
++    // `BDONE` and the `strata batch:` summary print from, so these checks pin what those numbers mean.
++    std::printf("stage_plan: the MTP acceptance of a batch period (delta 3's measurement)\n");
++    {
++        DraftAccept d;
++        check(d.offered == 0 && d.accepted == 0 && d.rate() == 0.0,
++              "a period that drafted nothing: 0 of 0, rate 0 (never a NaN)");
++        d.observe(true); d.observe(true); d.observe(true);
++        check(d.offered == 3 && d.accepted == 3 && d.rate() == 1.0,
++              "three proposals, all picked: 3 of 3, rate 1");
++        for (int i = 0; i < 5; ++i) d.observe(false);
++        check(d.offered == 8 && d.accepted == 3 && d.rate() == 3.0 / 8.0,
++              "then five misses: 3 of 8 (the rate is accepted/offered)");
++    }
++    {
++        DraftAccept d;
++        d.observe(false);
++        check(d.offered == 1 && d.accepted == 0 && d.rate() == 0.0,
++              "one proposal, none picked: 0 of 1, rate 0 but offered 1 (not the fresh state)");
++        d.observe(true); d.observe(false); d.observe(true);
++        check(d.accepted == 2 && d.offered == 4 && d.rate() == 0.5, "two of four picked: rate 0.5");
++        d.accepted = 0; d.offered = 0;   // the summary resets the period like bt_windows does
++        check(d.rate() == 0.0, "a reset period: rate 0 again (offered guards the division)");
++    }
++
+     std::printf("stage_plan: --head-device\n");
+     bool ok = false;
+     std::string why;
+-- 
+2.53.0.windows.2
+

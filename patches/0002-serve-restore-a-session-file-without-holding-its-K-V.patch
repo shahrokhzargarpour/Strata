@@ -1,7 +1,7 @@
 From 08d8cd432bb9ba0f0d0fb0fd1caec10710adade7 Mon Sep 17 00:00:00 2001
 From: pspranger-throw <pspranger-throw@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 18:39:12 -0600
-Subject: [PATCH 02/13] serve: restore a session file without holding its K/V
+Subject: [PATCH 02/14] serve: restore a session file without holding its K/V
  in RAM
 
 The RESTORE path materialized the whole snapshot in host memory, so a deep

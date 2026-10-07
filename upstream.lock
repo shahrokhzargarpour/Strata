@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "layer": "strata-agnostic-layer",
-  "layer_version": "0.3.1",
+  "layer_version": "0.3.2",
   "descripcion": "Capa aditiva sobre Strata: tier de disco para slots/conversaciones en desuso (con layer-split) y caché de prefill del system prompt. Inerte sin flags.",
   "base": {
     "upstream": "https://github.com/Niko1221/Strata",
@@ -70,7 +70,12 @@
     { "id": "A25", "archivo": "tests/core/stage_plan_test.cpp", "patron": "draft_head_type", "que_protege": "delta 3: el test de regresion del defecto (62 checks)" },
     { "id": "A26", "archivo": "include/strata/core/stage_plan.hpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: la regla pura del encaje de una ventana de batch en el hand-off (una fila del hand-off por fila de la ventana, tope kVerifyMaxT)" },
     { "id": "A27", "archivo": "src/core/verify.cpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: el motor USA la regla pura en stage_batch (el rango NO se mide contra slots_.size()) y el guard que terminaba el motor ya no esta" },
-    { "id": "A28", "archivo": "tests/core/stage_plan_test.cpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: el test host-only que fija la regla (ventana multi-fila por slot + split, el tope y el caso vacio)" }
+    { "id": "A28", "archivo": "tests/core/stage_plan_test.cpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: el test host-only que fija la regla (ventana multi-fila por slot + split, el tope y el caso vacio)" },
+    { "id": "A29", "archivo": "include/strata/core/stage_plan.hpp", "patron": "DraftAccept", "que_protege": "delta 3 (medicion): el acumulador puro de la aceptacion MTP (ofertas verificadas y elegidas), host-testeado" },
+    { "id": "A30", "archivo": "src/program/generate.cpp", "patron": "MTP drafts accepted %lld of %lld", "que_protege": "delta 3 (medicion): la linea resumen `strata batch:` reporta la aceptacion MTP del periodo (lo que lee el Monitor)" },
+    { "id": "A31", "archivo": "src/program/generate.cpp", "patron": "bt_drafts.observe", "que_protege": "delta 3 (medicion): el motor USA el acumulador en la ventana de batch (por slot para el BDONE y por periodo para el resumen)" },
+    { "id": "A32", "archivo": "tests/core/stage_plan_test.cpp", "patron": "DraftAccept", "que_protege": "delta 3 (medicion): el test host-only que fija el acumulador (73 -> 79 checks)" },
+    { "id": "A33", "archivo": "serve/server.py", "patron": "def bdone_drafts", "que_protege": "delta 3 (medicion): el parser del server lee el sufijo del BDONE (accepted, offered) y tolera su ausencia" }
   ],
   "invariantes": [
     "Con los flags ausentes: paridad de tokens con upstream (inerte).",
@@ -99,6 +104,7 @@
     "Delta 3: --head-device no es un cambio de reparto de capas: los puntos del split no se mueven, solo que etapa corre el head.",
     "Delta 3: --head-device no es una afirmacion de velocidad: la estimacion por tiempo del instalador es un modelo (SMs x reloj), no una medicion.",
     "Delta 3: --batch-mtp con layer split NO fue medido en esta maquina (ambas GPUs ocupadas por produccion): el motor arranca y sirve, pero el tok/s y los drafts aceptados bajo split quedan sin medir.",
+    "Delta 3 (medicion): el motor AHORA reporta la aceptacion MTP (el BDONE por slot y la linea `strata batch:` del periodo), pero esta maquina NO la midio: el binario instrumentado exige una ventana de GPU (produccion ocupa las dos tarjetas). Se pide swap coordinado.",
     "Delta 3: la verificacion bit a bit del hand-off con batches y split exige 2 GPUs libres y NO se corrio.",
     "Delta 3: el ARREGLO del tipo del draft head esta cubierto host-only (draft_head_type + slot_mtp_reason en stage_plan_test) pero NO se verifico en vivo con el modelo: las dos GPUs las ocupa produccion (:5011) y :5012 no tiene listener. El binario arreglado se probo solo hasta compilar y pasar la bateria host-only.",
     "Delta 3: el defecto del tipo es de UPSTREAM (src/core/mtp.cpp no lo toca esta capa y v0.1.40.1/main tienen la misma omision en el bloque `shared != nullptr` de bind()); nuestro arreglo de una linea y el guard de arranque son un delta propio, y el aporte al upstream es que su --batch-mtp en UNA GPU falla igual cuando el rt trae draft_vocab.bin.",

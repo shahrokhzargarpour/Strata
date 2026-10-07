@@ -1,7 +1,7 @@
 From 304101ee9e9f75551e920a3861b6348502c42cab Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Wed, 7 Oct 2026 03:36:45 -0600
-Subject: [PATCH 13/13] layer split: a batch window's grouped rows cross the
+Subject: [PATCH 13/14] layer split: a batch window's grouped rows cross the
  stage hand-off
 
 A --batch-mtp window proposes two rows per slot - the confirmed token and its draft - so several consecutive
