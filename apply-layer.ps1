@@ -21,6 +21,9 @@ param(
   # Contra que se comprueba la paridad: la rama de la serie (default) o un punto CONGELADO
   # (p.ej. -Serie bea20c9 para la entrega del delta 2, que NO debe medirse contra la rama que siguio creciendo).
   [string]$Serie = 'layer/series',
+  # Lock con el que se verifica el arbol resultante.  Para una entrega CONGELADA hay que pasar el lock de
+  # esa entrega (el de su carpeta de tooling): el lock del arbol de trabajo ya tiene anclas posteriores.
+  [string]$Lock = (Join-Path $PSScriptRoot 'upstream.lock'),
   [switch]$SkipParity
 )
 
@@ -89,7 +92,7 @@ if (-not $serieOk -and -not $SkipParity) {
 Write-Host "--- verificando anclas sobre el arbol nuevo ---"
 $verify = Join-Path $PSScriptRoot 'verify-layer.ps1'
 if (Test-Path $verify) {
-  & pwsh -File $verify -Tree $Dst -Lock (Join-Path $PSScriptRoot 'upstream.lock')
+  & pwsh -File $verify -Tree $Dst -Lock $Lock
   if ($LASTEXITCODE -ne 0) { Write-Host "=== apply-layer: DERIVA. No uses este arbol hasta arreglar las anclas. ==="; exit 1 }
 } else { Write-Host "aviso: no encontre verify-layer.ps1" }
 
