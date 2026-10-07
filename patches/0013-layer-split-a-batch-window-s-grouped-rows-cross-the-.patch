@@ -1,0 +1,251 @@
+From 304101ee9e9f75551e920a3861b6348502c42cab Mon Sep 17 00:00:00 2001
+From: Shahrokh <design@cariblanco.best>
+Date: Wed, 7 Oct 2026 03:36:45 -0600
+Subject: [PATCH 13/13] layer split: a batch window's grouped rows cross the
+ stage hand-off
+
+A --batch-mtp window proposes two rows per slot - the confirmed token and its draft - so several consecutive
+rows name the SAME slot.  The verifier refused exactly that with a layer split ("grouped slot rows do not
+support a layer split yet"), and the refusal was fatal: the error rose to generate.cpp, the engine printed ERR
+and exited 1, and the serve launcher restarted the engine on every request that admitted a slot.
+
+The refusal was over-broad.  A stage split hands a window's residual on per ROW: row t of the window uses
+hand-off row hbase + t, indexed the same on every stage, so grouped rows cross it unchanged - and the per-slot
+state (GDN recurrence and conv history, the QSA K/V and indexer tail, the PLE history) was already handled per
+contiguous run of rows of one slot.  Two bounds had assumed one row per slot and are corrected here:
+stage_batch's range check now measures the window against the hand-off's own capacity (kVerifyMaxT rows, through
+the pure batch_rows_fit_handoff in core/stage_plan.hpp), and every stage of a split is sized for the --batch-mtp
+window, not only the first one (generate.cpp).  A window that genuinely does not fit is refused before any graph
+is captured, so an ineligible combination is a start-up concern and never ends the engine.
+
+Host-only: tests/core/stage_plan_test.cpp exercises batch_rows_fit_handoff (2 rows per slot over 1..4 slots, the
+exact-fit, the overrun, a group past the buffer, the empty window).  Inert by default: without --batch-mtp the
+window is max(--spec, --batch) and nothing changes.
+---
+ docs/BATCHING.md                   | 21 ++++++++++++---------
+ docs/MULTI_GPU.md                  |  7 +++++--
+ include/strata/core/stage_plan.hpp | 19 +++++++++++++++++++
+ src/core/verify.cpp                | 19 ++++++++++++++-----
+ src/program/generate.cpp           | 12 ++++++++----
+ tests/core/stage_plan_test.cpp     | 22 ++++++++++++++++++++++
+ 6 files changed, 80 insertions(+), 20 deletions(-)
+
+diff --git a/docs/BATCHING.md b/docs/BATCHING.md
+index 60e8dea..82a4e49 100644
+--- a/docs/BATCHING.md
++++ b/docs/BATCHING.md
+@@ -30,13 +30,15 @@ the engine says so in one line and batches as usual. RTX PRO 5000 owners measure
+ **With a layer split.** `--batch-mtp` runs under a layer split too: every stage keeps its own session per slot (it
+ already did, for plain batching) and each slot's **drafter** is built on the stage that runs the head - the last one -
+ from that stage's slot session, so the draft's K/V, its buffers and the residual rows it reads all live on that
+-card, and the window's residual crosses the hand-off like any other. The PLE session stays the first card's, where
+-the PLE table lives. Its VRAM therefore comes out of the **last card's** expert cache: `--batch 4 --batch-mtp` on
+-two cards costs that card four draft states (~0.9 GB each on the artifact this tree ships with) beside its four slot
+-sessions. **Not measured here**: this tree has run it only up to the point of a started, serving engine; the
+-throughput it buys under a split is unmeasured, and the one-GPU numbers above are the only ones there are. Under a
+-split, the drafts a window accepts also depend on which card holds the head (`--head-device`, docs/FLAGS.md): the
+-head and the drafter move together, and the head's card is the one that pays for both.
++card, and the window's residual crosses the hand-off like any other - **row by row**: a window row, whatever slot it
++names, writes hand-off row `hbase + t` and the next stage reads it back, so a `--batch-mtp` window (up to two rows
++per slot: the confirmed token and its draft) crosses the split unchanged. The PLE session stays the first card's,
++where the PLE table lives. Its VRAM therefore comes out of the **last card's** expert cache: `--batch 4 --batch-mtp`
++on two cards costs that card four draft states (~0.9 GB each on the artifact this tree ships with) beside its four
++slot sessions. **Not measured here**: the throughput it buys under a split is unmeasured (the one-GPU numbers above
++are the only ones there are), and the bit-exact batch-vs-solo comparison under a split is pending a window with both
++cards free. Under a split, the drafts a window accepts also depend on which card holds the head (`--head-device`,
++docs/FLAGS.md): the head and the drafter move together, and the head's card is the one that pays for both.
+ 
+ With a layer split, the engine options go into the config's `args`:
+ 
+@@ -135,8 +137,9 @@ counter-based draw (Philox(seed, position)).
+ 
+ - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
+   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
+-- Grouped MTP uses one proposal per slot. It runs under a layer split (delta 3), with the slot drafters on the last
+-  stage's card; what it buys there is unmeasured (the one-GPU +31 % to +39 % is).
++- Grouped MTP uses one proposal per slot. It runs under a layer split, with the slot drafters on the last stage's
++  card: a window's grouped rows (two per slot) cross the stage hand-off one row at a time, and every stage's verifier
++  is sized for the `--batch-mtp` window (delta 3a); what it buys there is unmeasured (the one-GPU +31 % to +39 % is).
+ - Repetition / frequency / presence penalties are not applied in batch windows.
+ - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
+   boundary, and not for pictures.
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index 36eaf4f..f7b573a 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -241,8 +241,11 @@ pipeline).
+ 
+ With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
+ pipelines them through the cards: see [BATCHING.md](BATCHING.md). With the MTP drafter, `--batch-mtp` also runs
+-under a layer split since delta 3 (each slot's drafter lives on the head's card, beside that card's slot sessions);
+-the throughput it buys there is not measured in this tree.
++under a layer split: each slot's drafter lives on the head's card, beside that card's slot sessions, and a window's
++grouped rows (the confirmed token and its draft, two per slot) cross the stage hand-off one row at a time - a window
++row writes hand-off row `hbase + t` on the stage that runs it and the next stage reads it back (delta 3a; before it
++the combination was refused at run time). The throughput and the bit-exact comparison under a split are not measured
++in this tree.
+ 
+ ## Which card runs the head (`--head-device`)
+ 
+diff --git a/include/strata/core/stage_plan.hpp b/include/strata/core/stage_plan.hpp
+index 2947ba8..2ca696e 100644
+--- a/include/strata/core/stage_plan.hpp
++++ b/include/strata/core/stage_plan.hpp
+@@ -51,6 +51,25 @@ inline const char* batch_mtp_reason(int batch, bool has_mtp, int spec, bool serv
+ /// The stage that owns the output head and the MTP draft layer: the last of the pipeline.
+ inline int head_stage_of(std::size_t n_stages) { return n_stages == 0 ? 0 : (int) n_stages - 1; }
+ 
++// ── The batch hand-off: how many rows a window needs, and whether they fit ─────────────────────────────────────
++//
++// A LAYER SPLIT hands a window's residual on through a per-ROW buffer: row `t` of the window (the t-th token,
++// whatever slot it belongs to) writes its residual, its pending write and its inject to hand-off row `hbase + t`,
++// and the next stage reads them back from the same row.  Both stages index by ROW, never by slot, so a window
++// needs `hbase + S` hand-off rows INDEPENDENT of how many distinct slots its rows name.
++//
++// That is exactly why a `--batch-mtp` window (one confirmed token + one draft per slot, so up to TWO consecutive
++// rows of the same slot) crosses the split unchanged: the per-slot state (GDN recurrence and conv history, the QSA
++// K/V and indexer tail, the PLE history) is already handled per contiguous run of rows of one slot
++// (verify.cpp's `while (t < S && rows[t] == rows[first])` groups), and the hand-off is per row.
++//
++// The buffer holds `max_rows` rows (the engine's kVerifyMaxT).  A layout that would run past it must be refused
++// BEFORE a graph is captured - and, per the project's contract, that refusal is an ineligible COMBINATION, never a
++// reason to end the engine.
++inline bool batch_rows_fit_handoff(int hbase, int S, int max_rows) {
++    return hbase >= 0 && S >= 1 && hbase + S <= max_rows;
++}
++
+ // ── The draft head's GGML type, and the reason --batch-mtp stays off when the drafters cannot run ──────────────
+ //
+ // A batch slot's drafter does not build the draft head's token subset: it COPIES the main drafter's (`dhead_`,
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 2811c9c..c18a9f7 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -1,6 +1,7 @@
+ // src/core/verify.cpp - see include/strata/core/verify.hpp.
+ #include "strata/core/verify.hpp"
+ #include "strata/core/remote_expert_opt.hpp"
++#include "strata/core/stage_plan.hpp"   // delta 3a: batch_rows_fit_handoff (the hand-off row bound, host-testable)
+ #include "strata/core/dma_batch.hpp"
+ #if defined(_WIN32)
+ #include <intrin.h>
+@@ -2218,8 +2219,15 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
+ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                            std::string& err) {
+     using namespace strata::kernels;
++    // DELTA 3a: with a layer split the bound is the HAND-OFF's capacity, not the slot count.  Row t of the window
++    // uses hand-off row hbase + t (one residual/pending-write/inject row per WINDOW row, indexed the same on every
++    // stage), so a window needs hbase + S rows whatever its slots are.  A --batch-mtp window carries up to two
++    // consecutive rows per slot (the confirmed token and its draft): refusing it because S > slots_ here (or in
++    // stage_batch's old grouped-rows guard) ended the engine mid-admission.  A layout that genuinely runs past the
++    // buffer is refused HERE, before any graph is captured - the ineligible combination is a start-up concern, not
++    // a runtime one.
+     if (S < 1 || S > max_t_ || hbase < 0 ||
+-        (next_ != nullptr && hbase + S > (int) slots_.size())) {
++        (next_ != nullptr && !batch_rows_fit_handoff(hbase, S, kVerifyMaxT))) {
+         err = "verify: batch rows out of range (init_slots)";
+         return false;
+     }
+@@ -2237,10 +2245,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
+             err = "verify: proposed rows must have consecutive positions";
+             return false;
+         }
+-        if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr) {
+-            err = "verify: grouped slot rows do not support a layer split yet";
+-            return false;
+-        }
++        // DELTA 3a: grouped rows (several consecutive rows of ONE slot - what a --batch-mtp window proposes)
++        // cross a layer split unchanged.  The hand-off is per WINDOW ROW (hbase + t) and every stage indexes it
++        // the same way, while the per-slot state is handled per contiguous run of rows of one slot (the groups in
++        // record_window, capture_commit_batch and commit_slot_prefixes).  There is no per-slot hand-off row to
++        // collide: the old blanket refusal here was over-broad and, worse, ended the engine on a live admission.
+     }
+     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+     const ModelGeometry& g = *g_;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 24d9a98..61cdd9c 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6243,6 +6243,11 @@ int main(int argc, char** argv) {
+                 v->set_always_publish(true);
+             }
+         }
++        // DELTA 3a: a --batch-mtp window is as wide as kVerifyMaxT ROWS (up to two rows per slot: the confirmed
++        // token and its draft), and every stage of a layer split verifies those same rows, so EVERY stage's
++        // verifier is sized for kVerifyMaxT - not just the first one.  With one GPU, or without the flag, this is
++        // max(o.spec, o.batch) exactly as before (the hand-off is one row per window row, so the stages must agree).
++        const int verifier_max_t = batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch);
+         if (n_stages > 1) {
+             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+@@ -6269,7 +6274,7 @@ int main(int argc, char** argv) {
+             for (int st = 1; st < n_stages; ++st) {
+                 bool ok_s = false;
+                 if (split_same) {
+-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err);
++                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, verifier_max_t, err);
+                 } else {
+                     GpuStage& gs = *stages[(size_t) st - 1];
+                     const strata::core::OnDevice on(gs.dev);
+@@ -6281,7 +6286,7 @@ int main(int argc, char** argv) {
+                     vs.slot_off = gs.cache.slot_offsets();
+                     vs.n_slots = gs.cache.slots();
+                     gs.ver.set_remote_expert_opt(remote_opt.get());
+-                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, std::max(o.spec, o.batch), err);
++                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, verifier_max_t, err);
+                     split_drive.cache_base[st] = gs.cache.device_slot(0);
+                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
+                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+@@ -6350,8 +6355,7 @@ int main(int argc, char** argv) {
+         // `ver` (the first stage's verifier) is NOT wrapped: it reads its device from the current one, which must
+         // stay the primary context's.
+         const int draft_dev = last_st ? last_st->dev : -1;
+-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err)) {
++        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, verifier_max_t, err)) {
+             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+             return 1;
+         }
+diff --git a/tests/core/stage_plan_test.cpp b/tests/core/stage_plan_test.cpp
+index 58b16ae..9374e84 100644
+--- a/tests/core/stage_plan_test.cpp
++++ b/tests/core/stage_plan_test.cpp
+@@ -19,6 +19,7 @@
+ #include <vector>
+ 
+ using strata::core::batch_mtp_reason;
++using strata::core::batch_rows_fit_handoff;
+ using strata::core::draft_head_type;
+ using strata::core::head_stage_of;
+ using strata::core::order_with_head_device;
+@@ -81,6 +82,27 @@ int main() {
+     check(head_stage_of(4) == 3, "four stages: the head is the last (stage 3)");
+     check(head_stage_of(0) == 0, "no stage: stage 0 (degenerate, never reached)");
+ 
++    // ── The batch hand-off (delta 3a): a window with SEVERAL rows per slot crossing a layer split ───────────────
++    //
++    // A --batch-mtp window proposes up to two rows per slot (the confirmed token and its draft), so its rows are
++    // grouped - [0,0,1,1,2,2,3,3] over four slots.  A layer split hands the residuals on through a per-ROW buffer
++    // (row t of the window uses hand-off row hbase + t on every stage), so the window fits whenever its ROW COUNT
++    // fits the buffer (kVerifyMaxT = 8), regardless of how many distinct slots those rows name.  Before delta 3a
++    // this combination was refused at RUN TIME - `verify: grouped slot rows do not support a layer split yet` -
++    // which ended the engine (exit 1) on a live admission.  These checks pin the ruling that replaced it.
++    std::printf("stage_plan: the batch hand-off (grouped rows across a layer split)\n");
++    for (int slots = 1; slots <= 4; ++slots)
++        check(batch_rows_fit_handoff(0, 2 * slots, 8),
++              std::to_string(slots) + " slot(s), 2 rows each: the window fits the 8-row hand-off");
++    check(batch_rows_fit_handoff(0, 8, 8), "8 rows over 8 slots: fits (the same 8-row bound)");
++    check(batch_rows_fit_handoff(0, 8, 8), "8 rows over 4 slots (2 each): fits - the bound is the ROW count, not the slots");
++    check(!batch_rows_fit_handoff(0, 9, 8), "9 rows in an 8-row hand-off: refused before any graph is captured");
++    // a pipeline group's rows start at its base: base + S must stay inside the buffer
++    check(batch_rows_fit_handoff(4, 4, 8), "a later group (base 4, 4 rows): fits");
++    check(!batch_rows_fit_handoff(5, 4, 8), "a later group past the buffer (base 5, 4 rows): refused");
++    check(!batch_rows_fit_handoff(-1, 2, 8), "a negative base: refused");
++    check(!batch_rows_fit_handoff(0, 0, 8), "an empty window: refused");
++
+     std::printf("stage_plan: --head-device\n");
+     bool ok = false;
+     std::string why;
+-- 
+2.53.0.windows.2
+

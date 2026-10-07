@@ -1,7 +1,7 @@
 From 36d2695d239e15f19d90ece139030a733ed8f0c6 Mon Sep 17 00:00:00 2001
 From: Strata layer <layer@studioz.local>
 Date: Wed, 7 Oct 2026 02:32:01 -0600
-Subject: [PATCH 12/12] layer split: a batch slot's draft head keeps the main
+Subject: [PATCH 12/13] layer split: a batch slot's draft head keeps the main
  drafter's format (and a flag never ends the engine)
 
 A slot's drafter does not build the draft head's token subset: it copies the main drafter's (dhead_, dvocab_,

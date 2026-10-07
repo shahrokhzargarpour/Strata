@@ -1,7 +1,7 @@
 From 10655ecd51c3204d7603b3ca849a407c9eaa1db0 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 21:45:18 -0600
-Subject: [PATCH 06/12] system-prompt prefill cache works with --layer-split
+Subject: [PATCH 06/13] system-prompt prefill cache works with --layer-split
  (one session file per stage) and with host-RAM K/V
 
 The F5 gate only enabled the cache with stages.empty() && use_mtp (single GPU). This removes that restriction and makes the variant a per-stage artifact: one byte-for-byte session file per stage plus a joint sidecar (same carve the conversation disk tier writes), so the cache works multi-GPU and under --batch. The sidecar is v2 (stage count + total bytes; v1 still read) with a checksum; the scan never deletes (a broken sidecar, a foreign identity, an orphan file and an incomplete variant are counted and kept), and only the GC removes, oldest first.

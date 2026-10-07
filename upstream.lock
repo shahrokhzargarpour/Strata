@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "layer": "strata-agnostic-layer",
-  "layer_version": "0.3.0",
+  "layer_version": "0.3.1",
   "descripcion": "Capa aditiva sobre Strata: tier de disco para slots/conversaciones en desuso (con layer-split) y caché de prefill del system prompt. Inerte sin flags.",
   "base": {
     "upstream": "https://github.com/Niko1221/Strata",
@@ -67,7 +67,10 @@
     { "id": "A22", "archivo": "src/core/mtp.cpp", "patron": "dhead_type_ = strata::core::draft_head_type", "que_protege": "delta 3: bind() USA esa resolucion al compartir el draft head con los slots" },
     { "id": "A23", "archivo": "src/core/mtp.cpp", "patron": "slot_mtp_reason", "que_protege": "delta 3: el drafter RECHAZA en bind un tipo sin camino MMVQ nativo (arranque, no mitad de admision)" },
     { "id": "A24", "archivo": "src/program/generate.cpp", "patron": "disable_batch_mtp", "que_protege": "delta 3: fail-open - un drafter de slot o un draft que falla APAGA el flag, nunca termina el proceso" },
-    { "id": "A25", "archivo": "tests/core/stage_plan_test.cpp", "patron": "draft_head_type", "que_protege": "delta 3: el test de regresion del defecto (62 checks)" }
+    { "id": "A25", "archivo": "tests/core/stage_plan_test.cpp", "patron": "draft_head_type", "que_protege": "delta 3: el test de regresion del defecto (62 checks)" },
+    { "id": "A26", "archivo": "include/strata/core/stage_plan.hpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: la regla pura del encaje de una ventana de batch en el hand-off (una fila del hand-off por fila de la ventana, tope kVerifyMaxT)" },
+    { "id": "A27", "archivo": "src/core/verify.cpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: el motor USA la regla pura en stage_batch (el rango NO se mide contra slots_.size()) y el guard que terminaba el motor ya no esta" },
+    { "id": "A28", "archivo": "tests/core/stage_plan_test.cpp", "patron": "batch_rows_fit_handoff", "que_protege": "delta 3a: el test host-only que fija la regla (ventana multi-fila por slot + split, el tope y el caso vacio)" }
   ],
   "invariantes": [
     "Con los flags ausentes: paridad de tokens con upstream (inerte).",
@@ -84,7 +87,9 @@
     "Delta 3: sin --batch-mtp el camino de batch es el de upstream (la elegibilidad solo se consulta con el flag encendido).",
     "Delta 3: con una sola GPU bslot_ss.size() == 1 y el indice de etapa del drafter de slot es 0, como siempre.",
     "Delta 3 (fail-open): --batch-mtp NUNCA termina el proceso. Si un drafter de slot no se puede construir, o si su tipo de draft head no tiene camino MMVQ nativo, o si un draft falla en runtime, el flag se apaga con el motivo en el log y los slots siguen decodificando sin drafts.",
-    "Delta 3 (defecto de upstream, arreglado aqui): un drafter de slot COMPARTE el draft head del drafter principal (dhead_/dvocab_) y debe compartir su FORMATO. En la base, dhead_type_ quedaba en -1 y native_mmvq(-1, ...) lanzaba 'unsupported native MMVQ GGML type' en la primera admision; el motor salia con exit 1."
+    "Delta 3 (defecto de upstream, arreglado aqui): un drafter de slot COMPARTE el draft head del drafter principal (dhead_/dvocab_) y debe compartir su FORMATO. En la base, dhead_type_ quedaba en -1 y native_mmvq(-1, ...) lanzaba 'unsupported native MMVQ GGML type' en la primera admision; el motor salia con exit 1.",
+    "Delta 3a: una ventana de batch con varias filas consecutivas del MISMO slot (lo que produce --batch-mtp: 1 token confirmado + 1 drafteado por slot) cruza el hand-off de un layer split. El hand-off es por FILA de la ventana (hrow0 + t), contiguo e indexado igual en cada etapa, asi que una fila repetida no lo rompe; el estado por slot (GDN, QSA/indexer, PLE) ya se maneja por grupos de filas contiguas del mismo slot. El techo es la capacidad del hand-off (kVerifyMaxT filas), NO el conteo de slots.",
+    "Delta 3a (fail-open): el guard 'grouped slot rows do not support a layer split yet' que terminaba el motor (exit 1) en plena admision ya no esta; una ventana que de verdad no entra se rechaza ANTES de capturar un grafo. Con una sola GPU o sin --batch-mtp el max_t_ de la ventana es max(--spec, --batch) y el comportamiento es el de la base."
   ],
   "no_afirmaciones": [
     "La atencion es causal: no se puede conservar la cola de una conversacion bajo un system prompt distinto.",
@@ -96,6 +101,8 @@
     "Delta 3: --batch-mtp con layer split NO fue medido en esta maquina (ambas GPUs ocupadas por produccion): el motor arranca y sirve, pero el tok/s y los drafts aceptados bajo split quedan sin medir.",
     "Delta 3: la verificacion bit a bit del hand-off con batches y split exige 2 GPUs libres y NO se corrio.",
     "Delta 3: el ARREGLO del tipo del draft head esta cubierto host-only (draft_head_type + slot_mtp_reason en stage_plan_test) pero NO se verifico en vivo con el modelo: las dos GPUs las ocupa produccion (:5011) y :5012 no tiene listener. El binario arreglado se probo solo hasta compilar y pasar la bateria host-only.",
-    "Delta 3: el defecto del tipo es de UPSTREAM (src/core/mtp.cpp no lo toca esta capa y v0.1.40.1/main tienen la misma omision en el bloque `shared != nullptr` de bind()); nuestro arreglo de una linea y el guard de arranque son un delta propio, y el aporte al upstream es que su --batch-mtp en UNA GPU falla igual cuando el rt trae draft_vocab.bin."
+    "Delta 3: el defecto del tipo es de UPSTREAM (src/core/mtp.cpp no lo toca esta capa y v0.1.40.1/main tienen la misma omision en el bloque `shared != nullptr` de bind()); nuestro arreglo de una linea y el guard de arranque son un delta propio, y el aporte al upstream es que su --batch-mtp en UNA GPU falla igual cuando el rt trae draft_vocab.bin.",
+    "Delta 3a: la verificacion BIT A BIT solo-vs-batch CON layer split y el tok/s de --batch-mtp bajo split NO se midieron en esta maquina: las dos GPUs las ocupa produccion (:5011) y el contrato pide no tocar ese runtime. El binario arreglado se probo hasta COMPILAR (strata.exe, exit 0) y la BATERIA HOST-ONLY (10/10) mas el verificador de capa; el E2E de 4 concurrentes y la paridad bit a bit quedan PENDIENTES con su comando exacto, pedidos como ventana de GPU en el informe.",
+    "Delta 3a: el guard que terminaba el motor estaba en UPSTREAM (main tiene el mismo `if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr)`); el rango por slots_.size() y el max_t_ del split tambien. Este delta los corrige localmente y es candidato a aporte."
   ]
 }

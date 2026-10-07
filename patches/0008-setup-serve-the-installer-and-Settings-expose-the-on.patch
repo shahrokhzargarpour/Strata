@@ -1,7 +1,7 @@
 From 56e9ce6e9141caaa7419086fd73a1fb3f9934d4e Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 22:19:26 -0600
-Subject: [PATCH 08/12] setup, serve: the installer and Settings expose the
+Subject: [PATCH 08/13] setup, serve: the installer and Settings expose the
  on-disk layer (off by default)
 
 setup.py asks for it (--conversation-cache-spill-dir, --system-prompt-cache) and

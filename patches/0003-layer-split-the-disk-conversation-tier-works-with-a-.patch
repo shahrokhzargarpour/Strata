@@ -1,7 +1,7 @@
 From 0cc9b48b512639147a2c0de5f28cf78f823741e4 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 19:01:35 -0600
-Subject: [PATCH 03/12] layer-split: the disk conversation tier works with a
+Subject: [PATCH 03/13] layer-split: the disk conversation tier works with a
  stage split, and the scan never deletes
 
 Delta 1 over the upstream spill tier (#1271).
