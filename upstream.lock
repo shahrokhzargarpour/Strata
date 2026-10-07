@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "layer": "strata-agnostic-layer",
-  "layer_version": "0.2.0",
+  "layer_version": "0.3.0",
   "descripcion": "Capa aditiva sobre Strata: tier de disco para slots/conversaciones en desuso (con layer-split) y caché de prefill del system prompt. Inerte sin flags.",
   "base": {
     "upstream": "https://github.com/Niko1221/Strata",
@@ -36,6 +36,10 @@
       "--system-prompt-cache-slots",
       "--system-prompt-cache-max-age-days",
       "--system-prompt-cache-key"
+    ],
+    "delta_3": [
+      "--head-device",
+      "--batch-mtp"
     ]
   },
   "anclas": [
@@ -49,7 +53,16 @@
     { "id": "A8", "archivo": "src/program/generate.cpp", "patron": "--system-prompt-cache", "que_protege": "parser de args: los flags del system prompt existen" },
     { "id": "A9", "archivo": "CMakeLists.txt", "patron": "conversation_spill_test", "que_protege": "los tests del tier estan registrados en el build" },
     { "id": "A10", "archivo": "src/program/generate.cpp", "patron": "--conversation-cache-spill-on", "que_protege": "parser de args: el modo del tier (park por defecto cuando el tier esta encendido)" },
-    { "id": "A11", "archivo": "include/strata/core/conversation_spill.hpp", "patron": "ConversationSpillWriter", "que_protege": "el escritor del park (colapso por conversacion, espejo en tiempo real)" }
+    { "id": "A11", "archivo": "include/strata/core/conversation_spill.hpp", "patron": "ConversationSpillWriter", "que_protege": "el escritor del park (colapso por conversacion, espejo en tiempo real)" },
+    { "id": "A12", "archivo": "include/strata/core/stage_plan.hpp", "patron": "order_with_head_device", "que_protege": "delta 3: la resolucion del dispositivo del head (funcion pura, testeada host-only)" },
+    { "id": "A13", "archivo": "include/strata/core/stage_plan.hpp", "patron": "batch_mtp_reason", "que_protege": "delta 3: la elegibilidad de --batch-mtp (el layer split ya no la apaga)" },
+    { "id": "A14", "archivo": "src/program/generate.cpp", "patron": "--head-device", "que_protege": "delta 3: parser de args del dispositivo del head" },
+    { "id": "A15", "archivo": "src/program/generate.cpp", "patron": "strata::core::batch_mtp_reason", "que_protege": "delta 3: el motor USA la regla pura (no una copia inline divergente)" },
+    { "id": "A16", "archivo": "src/program/generate.cpp", "patron": "bslot_ss[head_slot]", "que_protege": "delta 3: el drafter de cada slot se carga sobre la sesion de slot de la etapa del head" },
+    { "id": "A17", "archivo": "tests/core/stage_plan_test.cpp", "patron": "head_stage_of", "que_protege": "delta 3: el test host-only que fija las dos decisiones" },
+    { "id": "A18", "archivo": "CMakeLists.txt", "patron": "stage_plan_test", "que_protege": "delta 3: el test esta registrado en el build" },
+    { "id": "A19", "archivo": "serve/server.py", "patron": "ordered_gpus", "que_protege": "delta 3: el orden de tarjetas (CUDA_VISIBLE_DEVICES) pone al head en la tarjeta elegida" },
+    { "id": "A20", "archivo": "tools/test_setup_head_device.py", "patron": "head_card_by_time", "que_protege": "delta 3: el test host-only del ranking por tiempo del instalador (mas VRAM no gana el head)" }
   ],
   "invariantes": [
     "Con los flags ausentes: paridad de tokens con upstream (inerte).",
@@ -61,11 +74,19 @@
     "Delta 2: con el tier encendido, --conversation-cache-spill-on vale park por defecto (espejo en tiempo real); evict reproduce delta 1 byte a byte. Sin tier, ninguna de las dos escribe nada.",
     "El espejo del park escribe al cerrar el pedido, nunca a mitad de la generacion, y colapsa los parks de una conversacion (una celda por conversacion, solo el estado mas nuevo).",
     "Una peticion cancelada deja un estado provisional: no publica copia durable y el estado vivo se revierte al ultimo limite de turno; la copia buena anterior no se toca.",
-    "Una copia cuyo encabezado coincide con el prompt entrante pero cuyo prefijo comun es menor a --conversation-cache-spill-divergence-tokens se descarta (compactacion); una de encabezado distinto es otra conversacion y no se toca."
+    "Una copia cuyo encabezado coincide con el prompt entrante pero cuyo prefijo comun es menor a --conversation-cache-spill-divergence-tokens se descarta (compactacion); una de encabezado distinto es otra conversacion y no se toca.",
+    "Delta 3: sin --head-device (-1) el orden de dispositivos es EXACTAMENTE el que arma --layer-split/--split-device: la capa es inerte.",
+    "Delta 3: sin --batch-mtp el camino de batch es el de upstream (la elegibilidad solo se consulta con el flag encendido).",
+    "Delta 3: con una sola GPU bslot_ss.size() == 1 y el indice de etapa del drafter de slot es 0, como siempre."
   ],
   "no_afirmaciones": [
     "La atencion es causal: no se puede conservar la cola de una conversacion bajo un system prompt distinto.",
     "Un archivo de otro modelo o de otro cuant de KV se rechaza, no se reusa.",
-    "El tier de disco no acelera el camino que ya reutiliza: no arregla residencia de VRAM ni planificacion."
+    "El tier de disco no acelera el camino que ya reutiliza: no arregla residencia de VRAM ni planificacion.",
+    "Delta 3: --head-device NO mueve el contexto primario (el dispositivo 0 corre siempre la primera etapa y el camino del prompt), asi que no puede poner el head ahi en un layer split; para eso haria falta una etapa final solo-head, que NO esta implementada.",
+    "Delta 3: --head-device no es un cambio de reparto de capas: los puntos del split no se mueven, solo que etapa corre el head.",
+    "Delta 3: --head-device no es una afirmacion de velocidad: la estimacion por tiempo del instalador es un modelo (SMs x reloj), no una medicion.",
+    "Delta 3: --batch-mtp con layer split NO fue medido en esta maquina (ambas GPUs ocupadas por produccion): el motor arranca y sirve, pero el tok/s y los drafts aceptados bajo split quedan sin medir.",
+    "Delta 3: la verificacion bit a bit del hand-off con batches y split exige 2 GPUs libres y NO se corrio."
   ]
 }

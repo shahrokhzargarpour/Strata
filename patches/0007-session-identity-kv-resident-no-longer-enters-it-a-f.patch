@@ -1,7 +1,7 @@
 From c10b8ff6d631541a86ba6962ee2c6daf4c7b5165 Mon Sep 17 00:00:00 2001
 From: Shahrokh <design@cariblanco.best>
 Date: Tue, 6 Oct 2026 22:01:24 -0600
-Subject: [PATCH 07/10] session identity: --kv-resident no longer enters it (a
+Subject: [PATCH 07/11] session identity: --kv-resident no longer enters it (a
  file restores under any residency)
 
 --kv-resident says WHERE the same K/V bytes live (VRAM slots vs the authoritative host pool), never what they mean; the residency is re-armed at restore by refill_residency (kv_stream_reset / kv_ring_restore). It was in SessionConfig and in session_config_fingerprint, so a session saved under one residency was refused under another - the opposite of what the user requires. Remove it from both (and from the engine's config mapping in generate.cpp); keep max_context and mtp_window, which bound the state's shape/capacity and are not re-armed.

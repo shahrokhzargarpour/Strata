@@ -39,7 +39,10 @@ if ($Exe) {
   if (-not (Test-Path $Exe)) { Write-Host "  [FALLA] no existe el binario: $Exe"; $fallas += "binario ausente" }
   else {
     $help = & $Exe --help 2>&1 | Out-String
-    $todos = @($lk.flags.tier_de_disco) + @($lk.flags.system_prompt)
+    # agnostico a la version: TODOS los grupos de flags del lock, no solo los dos de la capa base
+    $todos = @()
+    foreach ($grupo in $lk.flags.PSObject.Properties) { $todos += @($grupo.Value) }
+    Write-Host ("  (grupos del lock: " + (($lk.flags.PSObject.Properties.Name) -join ', ') + " = $($todos.Count) flags)")
     foreach ($f in $todos) {
       if ($help -match [regex]::Escape($f)) { Write-Host ("  [ok]    {0}" -f $f) }
       else { Write-Host ("  [FALLA] el motor NO conoce {0}" -f $f); $fallas += "flag ausente: $f" }

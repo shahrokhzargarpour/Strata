@@ -17,7 +17,8 @@ param(
   [string]$Upstream = 'https://github.com/Niko1221/Strata',
   [Parameter(Mandatory=$true)][string]$Tag,
   [Parameter(Mandatory=$true)][string]$Dst,
-  [string]$Patches = (Join-Path $PSScriptRoot 'patches')
+  [string]$Patches = (Join-Path $PSScriptRoot 'patches'),
+  [switch]$SkipParity
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,6 +52,37 @@ foreach ($p in $patchFiles) {
   }
 }
 Pop-Location
+
+Write-Host "--- paridad de arbol exacta contra la rama de la serie ---"
+# Que el arbol aplicado sea EXACTAMENTE la rama que se entrega (layer/series), no solo "las anclas siguen ahi":
+# se trae la rama de este repo al clon y se compara.  Una diferencia es fallo: significa que patches/ no
+# reproduce la serie (un commit sin exportar, un archivo de mas, o un parche que aplico distinto).
+$serie = 'layer/series'
+$serieOk = $false
+git -C $PSScriptRoot rev-parse --verify --quiet $serie | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "  [aviso] este repo no tiene la rama ${serie}: no puedo comprobar paridad (corre -SkipParity para saltarla)"
+} else {
+  git -C $Dst fetch --quiet $PSScriptRoot "refs/heads/${serie}:refs/remotes/layer/series"
+  if ($LASTEXITCODE -ne 0) { Write-Host "  [FALLA] no pude traer $serie al clon" }
+  else {
+    $dirty = git -C $Dst status --porcelain
+    git -C $Dst diff --quiet 'refs/remotes/layer/series' -- .
+    $serieOk = ($LASTEXITCODE -eq 0) -and (-not $dirty)
+    if ($serieOk) { Write-Host "  [ok]    el arbol aplicado es identico a $serie (HEAD $(git -C $Dst rev-parse --short HEAD))" }
+    else {
+      Write-Host "  [FALLA] el arbol aplicado NO es identico a ${serie}:"
+      if ($dirty) { $dirty | ForEach-Object { Write-Host "     sin commitear: $_" } }
+      git -C $Dst diff --stat 'refs/remotes/layer/series' -- . | ForEach-Object { Write-Host "     $_" }
+    }
+  }
+}
+if (-not $serieOk -and -not $SkipParity) {
+  Write-Host ""
+  Write-Host "=== apply-layer: PARIDAD DE ARBOL FALLIDA. No uses este arbol: regenera patches/ con"
+  Write-Host "    git format-patch v<tag>..layer/series -o patches y volve a correrlo. ==="
+  exit 1
+}
 
 Write-Host "--- verificando anclas sobre el arbol nuevo ---"
 $verify = Join-Path $PSScriptRoot 'verify-layer.ps1'

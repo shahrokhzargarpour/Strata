@@ -1,0 +1,1073 @@
+From 31c12e56c6b6c772f727af8ab31685e48a934d20 Mon Sep 17 00:00:00 2001
+From: Strata layer <layer@studioz.local>
+Date: Wed, 7 Oct 2026 01:20:38 -0600
+Subject: [PATCH 11/11] layer split: --batch-mtp across the stages, and
+ --head-device picks the head's card
+
+--batch-mtp ran on one GPU only, because a slot's draft state could not be reasoned about across a stage
+hand-off.  With a layer split each stage already keeps its own session per slot, so the slot drafters now load on
+the stage that runs the head - the last one - from that stage's slot session (its QSA geometry, its host copy and
+its device), and bind that stage's weights and head with their residual buffers on its device.  The window's
+residual is the last stage's (final_R_all chains through the pipeline), and the draft K/V copies - at admission,
+and back to the solo path - run with the drafter's device current.  The PLE session stays the first card's slot
+session, where the PLE table lives, as the main drafter's does.  With one GPU bslot_ss.size() == 1, so the stage
+index is 0 and the lines are the ones they always were.
+
+The two decisions behind it are pure functions in core/stage_plan.hpp, exercised host-only by
+tests/core/stage_plan_test.cpp: whether --batch-mtp may run at all (a layer split no longer refuses it; every
+other requirement, and --split-device 0, still do), and which device owns the head.
+
+--head-device D (STRATA_HEAD_DEVICE) places the output head and, with it, the MTP draft layer - it reads the last
+stage's residual, so the two move together - by reordering the later stages so D is last.  A device the pipeline
+does not use, and the primary device of a split (it runs the first stage and the prompt path), are said in one
+line and the placement stays as it was.  Moving the head to another CARD is the card ORDER: the server lists the
+config's "head_device" (nvidia-smi numbering) last in CUDA_VISIBLE_DEVICES, so the engine's last stage is that
+card - no engine flag is involved, so an older engine understands it too - and setup --head-device N|auto picks
+that card by the estimated milliseconds per layer (SMs x clock, from the installed engine's own
+`strata-device --list-devices`) instead of by free VRAM, printing the estimate for the chosen pair even when it
+moves nothing.
+
+Inert by default, asserted in the host test: --head-device -1 returns the device order untouched, and the batch
+rule still refuses everything it refused before.
+---
+ CMakeLists.txt                     |   5 +
+ docs/BATCHING.md                   |  27 ++++--
+ docs/FLAGS.md                      |  16 ++-
+ docs/MULTI_GPU.md                  |  26 ++++-
+ include/strata/core/stage_plan.hpp |  95 ++++++++++++++++++
+ serve/server.py                    |  49 +++++++++-
+ setup.py                           | 140 +++++++++++++++++++++++++-
+ src/core/device.cu                 |  15 ++-
+ src/program/generate.cpp           | 109 ++++++++++++++++++---
+ tests/core/stage_plan_test.cpp     | 151 +++++++++++++++++++++++++++++
+ tools/test_setup_head_device.py    | 103 ++++++++++++++++++++
+ 11 files changed, 703 insertions(+), 33 deletions(-)
+ create mode 100644 include/strata/core/stage_plan.hpp
+ create mode 100644 tests/core/stage_plan_test.cpp
+ create mode 100644 tools/test_setup_head_device.py
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a3b3b96..d70326c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -120,6 +120,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(conversation_prompt_cache_test src/core/conversation_prompt_cache_test.cpp src/core/conversation_prompt_cache.cpp src/core/conversation_file.cpp)
+   target_include_directories(conversation_prompt_cache_test PRIVATE include)
+   add_test(NAME conversation_prompt_cache_test COMMAND conversation_prompt_cache_test)
++  # delta 3 (layer): the two pure decisions behind --batch-mtp under a layer split and --head-device.  Header-only,
++  # no CUDA and no model: it runs anywhere the host-only build does.
++  add_executable(stage_plan_test tests/core/stage_plan_test.cpp)
++  target_include_directories(stage_plan_test PRIVATE include)
++  add_test(NAME stage_plan_test COMMAND stage_plan_test)
+ endif()
+ 
+ if(STRATA_HIP_GFX906)
+diff --git a/docs/BATCHING.md b/docs/BATCHING.md
+index e1896fd..60e8dea 100644
+--- a/docs/BATCHING.md
++++ b/docs/BATCHING.md
+@@ -19,12 +19,24 @@ asked, with a note when it is more than setup would recommend.
+ "parallel": 2
+ ```
+ 
+-On one GPU with MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the
+-server's environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch
+-behaviour described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so
+-check the engine's free-memory log before using it on a smaller card. If it cannot run (one slot, no `--mtp`, a layer
+-split or helper GPU) the engine says so and batches as usual. RTX PRO 5000 owners measured +31% to +39% total
+-throughput with 2 to 4 clients (a RX R9700 run too); it has not been validated with a layer split.
++With MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args`, or `STRATA_BATCH_MTP=1` in the server's
++environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch behaviour
++described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers (on the card
++that holds the head), so check the engine's free-memory log before using it on a smaller card. If it cannot run (one
++slot, no `--mtp`, no `--spec T >= 2`, no `--serve`, or both stages of a split on one GPU through `--split-device 0`)
++the engine says so in one line and batches as usual. RTX PRO 5000 owners measured +31% to +39% total throughput with
++2 to 4 clients on one GPU (a RX R9700 run too).
++
++**With a layer split.** `--batch-mtp` runs under a layer split too: every stage keeps its own session per slot (it
++already did, for plain batching) and each slot's **drafter** is built on the stage that runs the head - the last one -
++from that stage's slot session, so the draft's K/V, its buffers and the residual rows it reads all live on that
++card, and the window's residual crosses the hand-off like any other. The PLE session stays the first card's, where
++the PLE table lives. Its VRAM therefore comes out of the **last card's** expert cache: `--batch 4 --batch-mtp` on
++two cards costs that card four draft states (~0.9 GB each on the artifact this tree ships with) beside its four slot
++sessions. **Not measured here**: this tree has run it only up to the point of a started, serving engine; the
++throughput it buys under a split is unmeasured, and the one-GPU numbers above are the only ones there are. Under a
++split, the drafts a window accepts also depend on which card holds the head (`--head-device`, docs/FLAGS.md): the
++head and the drafter move together, and the head's card is the one that pays for both.
+ 
+ With a layer split, the engine options go into the config's `args`:
+ 
+@@ -123,7 +135,8 @@ counter-based draw (Philox(seed, position)).
+ 
+ - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
+   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
+-- Grouped MTP currently uses one proposal per slot and requires one GPU; it does not support a layer split.
++- Grouped MTP uses one proposal per slot. It runs under a layer split (delta 3), with the slot drafters on the last
++  stage's card; what it buys there is unmeasured (the one-GPU +31 % to +39 % is).
+ - Repetition / frequency / presence penalties are not applied in batch windows.
+ - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
+   boundary, and not for pictures.
+diff --git a/docs/FLAGS.md b/docs/FLAGS.md
+index 9181d4a..b4cb4ef 100644
+--- a/docs/FLAGS.md
++++ b/docs/FLAGS.md
+@@ -14,6 +14,7 @@ cache").
+ - **`layer/base`** — this tree's base: upstream `v0.1.40.1` plus PR #1271 (the disk tier) and PR #1269.
+ - **`layer/delta1`** — this tree's own work on top of that base (the spill tier as overflow).
+ - **`layer/delta2`** — the mirror at the park, compaction detection and cancellation (on top of delta 1).
++- **`layer/delta3`** — the batch-MTP slots across a layer split, and the device that runs the head (on top of delta 2).
+ - **`engine <version>`** — the flag came from upstream and is unchanged here.
+ 
+ ## Three caches, not one
+@@ -69,7 +70,20 @@ removes, by budget and (if enabled) by age, oldest first, with a counter and a l
+ | `--system-prompt-cache-max-age-days N` | 0 (off) | Optional age pruning. A positive N removes variants older than N days, oldest first. | `--serve`; inside the system-prompt cache. `0` means no deletion by time at all. | Off by default. Independent of the count/byte GC; each has its own counter. | `layer/delta1` |
+ | `--system-prompt-cache-key STR` | empty | An optional declared identity, added to the variant key beside the prefix hash. | `--serve`; inside the system-prompt cache. | It only gives two identical prefixes distinct variants (for example two deployments that must not share one). It does not make a **different** system prompt reusable. | `layer/delta1` |
+ 
+-## C. Upstream flags these are confused with
++## C. Where the head runs, and the batch slots beside a layer split (delta 3)
++
++The output head and the MTP draft layer run on the **last stage** of a layer split, and the split search places the
++layers - never the head. On a two-card machine that means the head lands on whichever card the pipeline ends on,
++which is not necessarily the faster one (`auto` orders by generation, and the head follows). `--head-device` is the
++placement of its own; the card **order** is what puts the head on another card.
++
++| Flag | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
++| --- | --- | --- | --- | --- | --- |
++| `--head-device D` (env `STRATA_HEAD_DEVICE`) | `-1` (as placed: the last stage) | The device that runs the output head **and**, with it, the MTP draft layer (the drafter reads the last stage's residual, so the two move together). It names one of the devices the pipeline already uses (`0` is the primary, the rest are `--split-device`): the later stages are reordered so that one is last. | `--serve` with a layer split. With one card it is a no-op (`D` must be `0`). A device that is not one of the pipeline's, or the primary device of a split, is **said and ignored** - the head stays where it was. | It is **not** a layer placement: the split points do not move, only which stage owns the head. It cannot move the head onto the primary device of a split (device 0 runs the first stage and the prompt path; a head-only tail stage is not implemented) - order the cards instead (below). It is **not** a speed claim: nothing measures anything here. | `layer/delta3` |
++| `"head_device": N` (config; the server reads it, not the engine) | absent | The card, numbered as `nvidia-smi` numbers them, that must hold the head. The server lists it **last** in `CUDA_VISIBLE_DEVICES`, so the engine's last stage - the head's - is that card. | The server's config (`strata-*.json`), or `setup --head-device N|auto`. Needs two or more cards in `"gpu"`; a card that is not one of them is refused. | It reorders the cards, so an **explicit** `"layer_split"` keeps its meaning *in the new order* ("24" is still "the second card starts at layer 24", but the second card is a different card). No engine flag is involved: an older engine understands it. | `layer/delta3` |
++| `--batch-mtp` (env `STRATA_BATCH_MTP=1`) | off | With `--batch N` and the MTP drafter (`--mtp`, `--spec T`), each batch slot also verifies **one** MTP proposal per window. | `--serve`, `--batch 2+`, `--mtp`, `--spec T >= 2`. **A layer split works too (delta 3)**: every stage keeps its own session per slot and the slot drafters live on the last stage's device. Not with `--split-device 0` (both stages on one GPU: the batch slots themselves need a card per stage). Anything else the engine says in one line (`WARNING: --batch-mtp is off: ...`) and batches as usual. | The VRAM it costs is per slot: the drafter's K/V and buffers, on the head's card. Upstream measured +31 % to +39 % total throughput on an RTX PRO 5000 with 2-4 clients **on one GPU**; this tree has **not** measured it under a layer split (docs/BATCHING.md says so). One proposal per slot: more drafts accepted per window is not what this does. | `engine 0.1.39` (upstream); the layer split with it is `layer/delta3` |
++
++## D. Upstream flags these are confused with
+ 
+ | Flag | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
+ | --- | --- | --- | --- | --- | --- |
+diff --git a/docs/MULTI_GPU.md b/docs/MULTI_GPU.md
+index fc39518..36eaf4f 100644
+--- a/docs/MULTI_GPU.md
++++ b/docs/MULTI_GPU.md
+@@ -2,7 +2,10 @@
+ 
+ One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
+ the first card runs layers 0 to K-1, the next card runs K onward, and so on; the last card also runs the output head
+-and the draft (MTP) layer. Each card keeps an expert cache for **its own layers only**, so two cards hold about twice
++and the draft (MTP) layer - which is a placement of its own: `--head-device D` picks which of the split's devices is
++the last stage (the head and the drafter follow it), and the card **order** is what moves it to another card
++(`"head_device": N` in the config, and `setup --head-device N|auto`, which ranks the cards by their estimated time
++per layer instead of by free VRAM; docs/FLAGS.md has both). Each card keeps an expert cache for **its own layers only**, so two cards hold about twice
+ the experts one card holds - for the Coder model on a 16 GB + 24 GB pair, nearly all of them, which is where the
+ speed comes from (decode then barely touches the CPU pool).
+ 
+@@ -237,4 +240,23 @@ pipeline).
+ ## Several conversations at once
+ 
+ With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
+-pipelines them through the cards: see [BATCHING.md](BATCHING.md).
++pipelines them through the cards: see [BATCHING.md](BATCHING.md). With the MTP drafter, `--batch-mtp` also runs
++under a layer split since delta 3 (each slot's drafter lives on the head's card, beside that card's slot sessions);
++the throughput it buys there is not measured in this tree.
++
++## Which card runs the head (`--head-device`)
++
++The output head and the MTP draft layer run on the **last stage**, and the split search never moves them: it places
++layers. On a two-card machine the head therefore follows the card the pipeline ends on - which is the *oldest
++generation* under `auto`'s ordering, not the fastest one. `--head-device D` (engine numbering: `0` is the primary,
++the rest are the `--split-device` list) reorders the later stages so `D` is last, and the head and the drafter go
++with it; a device the pipeline does not use, or the primary device of a split, is said and ignored (device 0 runs the
++first stage and the prompt path, so a head-only tail stage would be needed to put the head there - not implemented).
++
++To move the head to another **card**, set `"head_device": N` in the model's config (numbered as `nvidia-smi` numbers
++them). The server lists that card last in `CUDA_VISIBLE_DEVICES`, so the engine's last stage - the head's - is that
++card. No engine flag is involved, so an older engine understands it too. `setup --head-device auto` picks the card
++with the lowest **estimated** milliseconds per layer - the engine's own layer-cost model (SMs x clock) read from
++`strata-device --list-devices`, i.e. by time and not by free VRAM; `setup --head-device N` takes the user's own
++card. Setup prints that estimate for the chosen pair even when it is not asked to move anything ("recommend, never
++force").
+diff --git a/include/strata/core/stage_plan.hpp b/include/strata/core/stage_plan.hpp
+new file mode 100644
+index 0000000..412018f
+--- /dev/null
++++ b/include/strata/core/stage_plan.hpp
+@@ -0,0 +1,95 @@
++// include/strata/core/stage_plan.hpp - the pure decisions behind two of the engine's device rules:
++//
++//   1. whether --batch-mtp may run at all (and why not, in one line, when it may not); and
++//   2. the device that owns the output head and the MTP draft layer (--head-device / STRATA_HEAD_DEVICE).
++//
++// Nothing here includes CUDA and nothing here allocates: the engine calls these functions and
++// tests/core/stage_plan_test.cpp exercises the SAME code host-only, so the rule the engine applies is the
++// rule the test asserts, and a moved threshold shows up as a failing test instead of a silent behaviour change.
++//
++// Why the head is a placement of its own: the head (and the MTP draft layer, which reads the last stage's
++// residual) run on the LAST stage, and the layers are placed by the split search.  So the head's device is a
++// placement decision the split search never makes - on a 4080 + 3090 pair `auto` puts the head on whichever
++// card the pipeline ends on, which is not necessarily the faster one.  --head-device picks it.
++//
++// NO-AFIRMACIONES (docs/FLAGS.md keeps the same list):
++//   * --head-device chooses among the devices the pipeline already uses.  It does NOT move the primary
++//     context (device 0 always runs the first stage and the prompt path), so it cannot put the head on the
++//     primary device of a layer split; a head-only tail stage would be needed for that, and it is not
++//     implemented.  The card ORDER is what moves the head to another card (serve/server.py's "head_device"
++//     and the config's "gpu" list order, which becomes CUDA_VISIBLE_DEVICES).
++//   * It is not a speed claim: nothing here measures anything.  The installer's ranking (setup.py) estimates
++//     the per-layer time from the card's SMs and clock, which is the same estimate the split search uses.
++
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++/// Why --batch-mtp cannot run, or nullptr when it can.  The engine prints the reason and leaves the flag off
++/// (plain batching still starts); the default run (no flag) is exactly the base tag's.
++///
++/// `n_stages`: the pipeline's stages, 1 = one GPU, 2+ = a layer split into that many stages.
++/// `same_device_stages`: --split-device 0, both stages on the primary device (the batch slots themselves need
++/// each stage on its own GPU, so batch-MTP under it is refused for the same reason).
++inline const char* batch_mtp_reason(int batch, bool has_mtp, int spec, bool serve, bool same_device_stages,
++                                    std::size_t n_stages) {
++    (void) n_stages;   // a layer split is supported: every stage keeps its own session per slot, and the slot
++                       // drafters live on the stage that runs the head (the last one)
++    if (batch < 2) return "it needs --batch 2 or more";
++    if (!has_mtp) return "it needs --mtp";
++    if (spec < 2) return "it needs --spec T (T >= 2)";
++    if (!serve) return "it needs --serve";
++    if (same_device_stages) return "it needs each stage of a layer split on its own GPU";
++    return nullptr;
++}
++
++/// The stage that owns the output head and the MTP draft layer: the last of the pipeline.
++inline int head_stage_of(std::size_t n_stages) { return n_stages == 0 ? 0 : (int) n_stages - 1; }
++
++/// The pipeline's devices, in order, with the one that must own the head LAST.
++///
++/// `devices`: the devices as the pipeline runs them (devices[0] is the primary context's, the rest are the
++/// later stages' - the engine's --split-device list).
++/// `requested`: --head-device / STRATA_HEAD_DEVICE, or -1 for "as placed" (the last device, unchanged).
++///
++/// `ok` is false when the request cannot be reached, and `why` says it in one line (the caller prints it and
++/// keeps the placement, as it does for the other device knobs: recommend, never force).  When `ok` is true the
++/// returned vector is the device order to run: its last element is the head's device.
++inline std::vector<int> order_with_head_device(const std::vector<int>& devices, int requested, bool& ok,
++                                               std::string& why) {
++    ok = true;
++    why.clear();
++    if (devices.empty() || requested < 0) return devices;   // as placed
++    const int last = devices.back();
++    if (requested == last) return devices;
++    const bool known = std::find(devices.begin(), devices.end(), requested) != devices.end();
++    if (!known) {
++        ok = false;
++        why = "device " + std::to_string(requested) + " is not one of the pipeline's devices";
++        return devices;
++    }
++    std::size_t at = 0;
++    while (at < devices.size() && devices[at] != requested) ++at;
++    if (at == 0) {
++        // The primary context (device 0) runs the first stage and the prompt path, so the head cannot be
++        // moved onto it while the model spans several cards: the last stage is where the residual lands.
++        ok = false;
++        why = "device " + std::to_string(requested) + " is the primary one and runs the first stage; the head "
++              "cannot move there (a head-only tail stage is not implemented) - order the cards instead, so "
++              "that card is listed last (serve/server.py's \"head_device\")";
++        return devices;
++    }
++    // Move the requested device to the end; the others keep their relative order.
++    std::vector<int> out;
++    out.reserve(devices.size());
++    for (const int d : devices) if (d != requested) out.push_back(d);
++    out.push_back(requested);
++    return out;
++}
++
++}  // namespace strata::core
+diff --git a/serve/server.py b/serve/server.py
+index e929bd7..d54ab1d 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1884,6 +1884,45 @@ def gpu_list(cfg: dict) -> list[int]:
+     return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+ 
+ 
++def head_device_value(cfg: dict) -> int | None:
++    """Delta 3: the config's "head_device" - the card (numbered as nvidia-smi numbers them, the same numbering
++    "gpu" uses) that runs the output head and, with it, the MTP draft layer.  None when the config names none: the
++    engine's default, the last stage as placed.  ValueError for a card that is not one of this model's."""
++    v = cfg.get("head_device")
++    if v is None or (isinstance(v, str) and not v.strip()):
++        return None
++    try:
++        if isinstance(v, bool) or isinstance(v, float):
++            raise ValueError
++        n = int(str(v).strip())
++    except ValueError:
++        raise ValueError(f'"head_device" must be a card number as nvidia-smi numbers them, not {v!r}')
++    cards = gpu_list(cfg)
++    if len(cards) < 2:
++        raise ValueError('"head_device" needs two or more cards in "gpu" (one card runs the whole model)')
++    if n not in cards:
++        raise ValueError(f'"head_device" is {n}, which is not one of this model\'s cards '
++                         f'({", ".join(str(c) for c in cards)})')
++    return n
++
++
++def ordered_gpus(cfg: dict) -> list[int]:
++    """The config's cards with the head's LAST: the engine's device 0 is the first one it sees
++    (CUDA_VISIBLE_DEVICES follows this order) and the head runs on the last stage of a layer split, so listing the
++    head's card last is what puts the head (and the draft layer) on it.  Without "head_device" this is exactly the
++    config's "gpu", in order.  No engine flag is involved: an older engine understands it too."""
++    cards = gpu_list(cfg)
++    try:
++        head = head_device_value(cfg)
++    except ValueError:
++        head = None                                    # said by the caller; the engine runs the config's order
++    # a value that cannot be reached is refused at start by head_device_value's caller; here it only orders what it
++    # was given (and, when the config cannot be read, leaves the engine the config's own order)
++    if head is None or head not in cards:
++        return cards
++    return [c for c in cards if c != head] + [head]
++
++
+ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
+     """#458 (opt-in): the engine arguments for "effort_position": "end" - the id of "system" as --tail-role-token, so
+     the engine checkpoints in front of the trailing effort turn - or None when the config leaves it at the top (the
+@@ -2060,7 +2099,8 @@ def child_env(cfg: dict) -> dict:
+         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in hip_visible(cfg))
+     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
+         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
++        # delta 3: "head_device" moves that card to the end (the engine's last stage holds the head and the draft)
++        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
+     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
+         env[str(k)] = str(v)
+     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
+@@ -4946,6 +4986,13 @@ def main() -> int:
+             except ValueError as e:
+                 raise SystemExit(f"[strata] config {e}")
+             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
++        try:
++            head = head_device_value(cfg)               # delta 3: before the start, like the split (it orders them)
++        except ValueError as e:
++            raise SystemExit(f"[strata] config {e}")
++        if head is not None:
++            print(f"[strata] the head and the draft layer on GPU {head}: the cards are ordered "
++                  f"{ordered_gpus(cfg)}", flush=True)
+         # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
+         # it is told about (WinError 2), so it is made absolute here
+         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+diff --git a/setup.py b/setup.py
+index bc7e526..10d6cdd 100644
+--- a/setup.py
++++ b/setup.py
+@@ -756,6 +756,122 @@ def config_toolkit(cfg: dict) -> int:
+     return 12 if cfg.get("cuda") == 12 or Path(str(cfg.get("exe", ""))).parent.name == ENGINE12_DIR else 13
+ 
+ 
++# ---- delta 3 (layer): which card runs the output head (and, with it, the MTP draft layer)
++#
++# The head runs on the LAST stage of a layer split, so "which card" is a placement the engine's split search never
++# makes: with two cards the pipeline ends on whichever is listed last (the newest generation first today), which is
++# not necessarily the faster one.  The card's per-layer time is the engine's own model
++# (0.33 * 84 * 2.617 / (SMs x GHz), the fitted constant of its layer-split search), fed by the installed engine's
++# `strata-device --list-devices` - so the ranking is by TIME and not by free VRAM.  It is an estimate, not a
++# measurement: setup says so, and `--head-device N` overrides it with the user's own choice.
++HEAD_MS_FIT = 0.33 * 84.0 * 2.617
++
++
++def gpu_layer_ms(g, toolkit=13) -> float | None:
++    """This card's estimated milliseconds per layer, or None when no installed engine can report it.
++
++    The estimate is only ever used to RANK cards (which one should hold the head); nothing here claims it is a
++    measurement, and nothing is refused when it is missing."""
++    exe = engine_dir(toolkit) / ("strata-device.exe" if WIN else "strata-device")
++    if not exe.exists():
++        return None
++    env = dict(os.environ)
++    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"        # the same numbering the engine is told to use
++    env["CUDA_VISIBLE_DEVICES"] = str(g.get("index"))
++    try:
++        r = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True, timeout=180, env=env)
++    except (OSError, subprocess.SubprocessError):
++        return None
++    m = re.search(r"(\d+)\s+SMs at\s+([0-9.]+)\s*GHz", r.stdout or "")
++    if not m:
++        return None
++    sms, ghz = int(m.group(1)), float(m.group(2))
++    if sms <= 0 or ghz <= 0:
++        return None
++    return HEAD_MS_FIT / (sms * ghz)
++
++
++def head_card_by_time(cards, toolkit=13):
++    """The card the per-layer estimate puts the head on: the lowest ms, ties to the LAST of `cards` (the placement
++    the engine would have made anyway).  None when no card can be timed (setup then keeps the order as it is)."""
++    timed = [(gpu_layer_ms(g, toolkit), i) for i, g in enumerate(cards)]
++    timed = [(ms, i) for ms, i in timed if ms is not None]
++    if not timed:
++        return None
++    best = min(timed, key=lambda t: (t[0], -t[1]))
++    return cards[best[1]]
++
++
++def head_device_note(cards, toolkit=13) -> list[str]:
++    """What setup says about the head's card: the estimate, and how to move the head when it is not where the user
++    wants it.  Information only - setup changes no placement unless --head-device asks for it."""
++    if len(cards) < 2:
++        return []
++    times = [(g, gpu_layer_ms(g, toolkit)) for g in cards]
++    if all(ms is None for _g, ms in times):
++        return ["the per-layer time of these cards could not be estimated (no installed engine to ask): "
++                "the head (and the draft layer) stays on the last card listed"]
++    head = head_card_by_time(cards, toolkit)
++    parts = ", ".join(f"GPU {g['index']} {ms:.2f} ms/layer" for g, ms in times if ms is not None)
++    lines = [f"estimated per-layer time: {parts}",
++             f"the head (and the draft layer) runs on the last card listed; the estimate puts it "
++             f"{(('on GPU ' + str(head['index'])) if head is not None else 'on a card that could not be timed')}, "
++             f"and on GPU {cards[-1]['index']} as listed"]
++    if head is not None and head["index"] != cards[-1]["index"]:
++        lines.append(f"to put it there: setup --setup --head-device {head['index']}, or \"head_device\": "
++                     f"{head['index']} in the config (the card order decides: the last card listed holds the head)")
++    return lines
++
++
++def config_cards(cfg: dict) -> list:
++    """The config's "gpu" as a list of card numbers (one card, or several for a layer split)."""
++    g = cfg.get("gpu")
++    if g is None or g == "":
++        return []
++    items = g if isinstance(g, (list, tuple)) else str(g).split(",")
++    out = []
++    for x in items:
++        try:
++            out.append(int(str(x).strip()))
++        except ValueError:
++            continue
++    return out
++
++
++def apply_head_device(cfg: dict, asked, found=None) -> None:
++    """--head-device N|auto (delta 3): the card that runs the output head (and, with it, the MTP draft layer) is
++    the LAST of the config's cards - the engine's device 0 is the first listed (CUDA_VISIBLE_DEVICES follows this
++    order) and the head runs on the last stage of a split.  auto: the card with the lowest estimated ms per layer
++    (setup's own time estimate, never free VRAM).  Nothing here is asked for unless --head-device is given."""
++    if not asked:
++        return
++    cards = config_cards(cfg)
++    if len(cards) < 2:
++        warn("--head-device: one card runs the whole model, so there is no other card for the head")
++        return
++    if str(asked).strip().lower() == "auto":
++        byid = {g["index"]: g for g in (found or [])}
++        pick = head_card_by_time([byid[i] for i in cards if i in byid]) if byid else None
++        if pick is None:
++            warn("--head-device auto: no installed engine could report the cards' per-layer time; the order (and "
++                 "the head) stays as it is")
++            return
++        n = pick["index"]
++    else:
++        try:
++            n = int(str(asked).strip())
++        except ValueError:
++            fail(f"--head-device takes a card number as nvidia-smi numbers them, or auto, not {asked!r}")
++            return
++        if n not in cards:
++            fail(f"--head-device {n} is not one of this model's cards ({', '.join(str(c) for c in cards)})")
++            return
++    cfg["gpu"] = [c for c in cards if c != n] + [n]
++    cfg["head_device"] = n
++    ok(f"head (and the MTP draft layer) on GPU {n}: the cards are ordered "
++       f"{','.join(str(c) for c in cfg['gpu'])} (the last one holds the head)")
++
++
+ def gpu_problem(g, together=False):
+     """Why Strata cannot use this card, in plain words (None: it can)."""
+     if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
+@@ -1062,6 +1178,11 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+         split_budget(cfg)
+         recommend_remote_expert_opt(cfg)
+         ok("from now on this model runs on " + " + ".join(gpu_name(g) for g in pair))
++        # delta 3: the head (and the MTP draft layer) runs on the LAST card listed.  The per-layer estimate says
++        # which one is fastest - by time, not by free VRAM - and the line below is where to move it (nothing is
++        # moved here: setup recommends, it never forces).
++        for line in head_device_note(pair):
++            say("  " + line)
+     else:
+         ok("staying on one GPU (START-HERE.bat --gpus " + ",".join(str(g["index"]) for g in pair) + " switches)")
+     write_config(cfg_path, cfg)
+@@ -3523,9 +3644,9 @@ def settings_summary(cfg: dict, port=None) -> str:
+ 
+ 
+ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
+-          layer_split=None, keep=None) -> int:
++          layer_split=None, keep=None, head_device=None) -> int:
+     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
+-    --vram-reserve-mib)."""
++    --vram-reserve-mib).  head_device: --head-device N|auto (delta 3), the card that runs the output head."""
+     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
+     if missing:
+@@ -3594,6 +3715,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
+         cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
+         split_budget(cfg, yes, True)                   # #498: before it is saved (asks when the RAM is short, #737)
+         recommend_remote_expert_opt(cfg)
++        apply_head_device(cfg, head_device, found)     # delta 3: before the config is saved (it is part of "gpu")
+         write_config(cfg_path, cfg)
+         gpu = None
+     elif gpu is not None:                              # --gpu N: this start only, on that card
+@@ -4220,6 +4342,10 @@ def main() -> int:
+                          "Volta). 12 also runs with an older driver (Windows 528+, Linux 525+). docs/OLDER_GPUS.md")
+     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
+                     help="where the ready-made engine is (a URL folder or a local folder)")
++    ap.add_argument("--head-device", metavar="N|auto",
++                    help="several GPUs: the card that runs the output head and the MTP draft layer - a card number "
++                         "as nvidia-smi numbers them, or auto (the fastest by the estimated ms per layer, not by free "
++                         "VRAM). The card is listed last, which is what puts the head there. docs/MULTI_GPU.md")
+     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+     ap.add_argument("--calibrate", action="store_true",
+                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
+@@ -4360,6 +4486,7 @@ def main() -> int:
+             warn("this PC is NOT tuned: the tuning failed (the reason is above); the model "
+                  + ("keeps" if a.no_start else "starts with") + " the default settings")
+         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
++                     head_device=a.head_device,
+                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
+                            "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
+@@ -4367,6 +4494,7 @@ def main() -> int:
+             update_installed_engine(a.prebuilt)
+         if len(have) == 1:
+             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
++                     head_device=a.head_device,
+                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
+                            "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+         say()
+@@ -4376,6 +4504,7 @@ def main() -> int:
+         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
+         if pick <= len(have):
+             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
++                     head_device=a.head_device,
+                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
+                            "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+ 
+@@ -5055,6 +5184,13 @@ def main() -> int:
+         cfg["layer_split"] = a.layer_split or "auto"
+         ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
+         recommend_remote_expert_opt(cfg, off=a.no_remote_expert_opt)
++        # delta 3: --head-device N|auto - the head (and the MTP draft layer) runs on the last card listed, and the
++        # estimate says which card is the fastest per layer (time, not free VRAM).  Said even when not asked.
++        _cards_by_id = {g["index"]: g for g in gpus()}
++        apply_head_device(cfg, a.head_device, gpus())
++        if a.head_device is None:                      # information only: setup moves nothing unless asked
++            for line in head_device_note([_cards_by_id[i] for i in config_cards(cfg) if i in _cards_by_id]):
++                say("  " + line)
+     if a.host:
+         cfg["host"] = a.host
+     if a.api_key:
+diff --git a/src/core/device.cu b/src/core/device.cu
+index a614f24..65d2549 100644
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -88,13 +88,18 @@ bool device_summary(int ordinal, std::string& name, std::string& detail) {
+         cudaGetLastError();
+         return false;
+     }
+-    char buf[160];
++    char buf[224];
++    // DELTA 3: the card's SMs and its clock are the engine's own per-layer time model's two inputs
++    // (0.33 * 84 * 2.617 / (SMs * GHz) in the layer-split search), so `strata-device --list-devices` reports them
++    // and setup ranks the cards by that time instead of by free VRAM.  Appended: the fields before them are the
++    // ones anything already parses.
++    const double ghz = p.clockRate > 0 ? (double) p.clockRate / 1.0e6 : 0.0;
+ #if defined(STRATA_USE_HIP)
+-    std::snprintf(buf, sizeof(buf), "arch %s, %.1f GiB, wave%d", base_arch(p.gcnArchName).c_str(),
+-                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024), p.warpSize);
++    std::snprintf(buf, sizeof(buf), "arch %s, %.1f GiB, wave%d, %d CUs at %.2f GHz", base_arch(p.gcnArchName).c_str(),
++                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024), p.warpSize, p.multiProcessorCount, ghz);
+ #else
+-    std::snprintf(buf, sizeof(buf), "compute capability %d.%d, %.1f GiB", p.major, p.minor,
+-                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024));
++    std::snprintf(buf, sizeof(buf), "compute capability %d.%d, %.1f GiB, %d SMs at %.2f GHz", p.major, p.minor,
++                  (double) p.totalGlobalMem / (1024.0 * 1024 * 1024), p.multiProcessorCount, ghz);
+ #endif
+     name = p.name;
+     detail = buf;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 34d5458..edb8fe4 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -33,6 +33,7 @@
+ #include "strata/core/layer.hpp"
+ #include "strata/core/layout.hpp"
+ #include "strata/core/session.hpp"
++#include "strata/core/stage_plan.hpp"   // delta 3: the batch-MTP eligibility and the head's device, host-tested
+ #include "strata/core/weights.hpp"
+ #include "strata/kernels/cpu/expert.hpp"
+ #include "strata/kernels/cpu/pool.hpp"
+@@ -536,6 +537,9 @@ struct Options {
+     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
+     int batch_groups = 1;
+     bool batch_mtp = false;      ///< --batch-mtp / STRATA_BATCH_MTP=1 (opt-in): one MTP proposal per batch slot
++    /// --head-device D / STRATA_HEAD_DEVICE (delta 3): the device that runs the output head and the MTP draft
++    /// layer. -1 = as placed (the last stage), which is what the base tag does. See core/stage_plan.hpp.
++    int head_device = -1;
+     std::string spec_oracle;
+     int spec_corrupt = 0;
+     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
+@@ -798,8 +802,14 @@ void usage() {
+                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
+                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
+                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
+-                 "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
+-                 "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
++                 "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP\n"
++                 "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot.\n"
++                 "                       A layer split works too: each stage keeps its own session per slot and the\n"
++                 "                       slot drafters live on the stage that runs the head (docs/BATCHING.md)\n"
++                 "  --head-device D      which device runs the output head and the MTP draft layer (STRATA_HEAD_DEVICE);\n"
++                 "                       default: the last stage, as placed. It chooses among the devices the pipeline\n"
++                 "                       already uses - the primary device runs the first stage, so it cannot host the\n"
++                 "                       head of a split (order the cards instead). docs/FLAGS.md\n"
+                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
+                  "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
+                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
+@@ -1749,6 +1759,7 @@ int main(int argc, char** argv) {
+         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
+         else if (a == "--batch-groups") o.batch_groups = std::atoi(next("--batch-groups"));
+         else if (a == "--batch-mtp") o.batch_mtp = true;
++        else if (a == "--head-device") o.head_device = std::atoi(next("--head-device"));
+         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
+         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
+@@ -2069,6 +2080,36 @@ int main(int argc, char** argv) {
+             return 2;
+         }
+     }
++    // ---- --head-device / STRATA_HEAD_DEVICE (delta 3): which device runs the output head (and, with it, the MTP
++    // draft layer, which reads the last stage's residual).  The pipeline's devices in order are the primary one and
++    // then the later stages' (--split-device); the head runs on the LAST, so the flag is a placement of its own that
++    // the split search never makes.  Recommend, never force: a value that cannot be reached is said in one line and
++    // the placement stays as it was (the other device knobs behave the same way).  See core/stage_plan.hpp.
++    if (o.head_device < 0) {
++        const char* hdv = std::getenv("STRATA_HEAD_DEVICE");
++        if (hdv != nullptr && hdv[0] != '\0') o.head_device = std::atoi(hdv);
++    }
++    if (o.head_device >= 0) {
++        std::vector<int> pipe_devs{0};
++        for (const int d : split_devs) pipe_devs.push_back(d);
++        bool hd_ok = false;
++        std::string hd_why;
++        const std::vector<int> order = strata::core::order_with_head_device(pipe_devs, o.head_device, hd_ok, hd_why);
++        if (!hd_ok) {
++            std::fprintf(stderr, "strata generate: --head-device %d: %s; the head stays on the last stage\n",
++                         o.head_device, hd_why.c_str());
++        } else if (order != pipe_devs) {
++            split_devs.assign(order.begin() + 1, order.end());   // the later stages keep order, the head's is last
++            std::string sd;
++            for (const int d : split_devs) sd += (sd.empty() ? "" : ",") + std::to_string(d);
++            std::fprintf(stderr, "strata generate: --head-device %d: the later stages run on --split-device %s, so "
++                                 "the head and the draft (MTP) layer are on CUDA%d\n", o.head_device, sd.c_str(),
++                         order.back());
++        } else {
++            std::fprintf(stderr, "strata generate: --head-device %d: it is already the last stage's device\n",
++                         o.head_device);
++        }
++    }
+     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
+     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
+@@ -3625,9 +3666,10 @@ int main(int argc, char** argv) {
+     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
+     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+     if (batch_mtp) {
+-        const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
+-                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : (multi_gpu || split_same || !stages.empty())
+-                        ? "it is for one GPU (no layer split or helper) for now" : !o.serve ? "it needs --serve" : nullptr;
++        // DELTA 3: a layer split is supported - every stage keeps its own session per slot and the slot drafters
++        // live on the stage that runs the head (below).  The rule itself is host-testable: core/stage_plan.hpp.
++        const char* why = strata::core::batch_mtp_reason(o.batch, !o.mtp.empty(), o.spec, o.serve, split_same,
++                                                         (size_t) (1 + stages.size()));
+         if (why != nullptr) {
+             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
+             batch_mtp = false;
+@@ -3729,9 +3771,15 @@ int main(int argc, char** argv) {
+         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+         mtp.set_ple_session(&ss);
+         if (batch_mtp) {
++            // DELTA 3: each slot's drafter is the main one for that slot.  It reads the residual the last stage
++            // leaves and keeps its own K/V, so under a layer split it is built and bound on the LAST stage's
++            // device, from that stage's slot session (`bslot_ss` is indexed by stage: 0 = CUDA0, k = the k-th
++            // later stage).  The PLE session stays CUDA0's slot session, where the PLE table lives, exactly as
++            // the main drafter's does.  With one GPU `bslot_ss.size() == 1` and this is the line it always ran.
++            const size_t head_slot = bslot_ss.size() - 1;
+             for (int b = 0; b < o.batch; ++b) {
+                 auto d = std::make_unique<strata::core::MtpDrafter>();
+-                if (!d->load(o.mtp, draft_geometry, *bslot_ss[0][(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
++                if (!d->load(o.mtp, draft_geometry, *bslot_ss[head_slot][(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
+                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
+                                  vram_free_note().c_str());
+                     return 1;
+@@ -6286,17 +6334,39 @@ int main(int argc, char** argv) {
+         }
+         ver.set_remote_expert_opt(remote_opt.get());
+         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
++        // DELTA 3: under a layer split the output head and the MTP draft layer live on the LAST stage's device, so
++        // the drafter's binding, its slots' bindings and their residual buffers are made with that device current.
++        // With one GPU `draft_dev` is -1 and every guard below is a no-op (the behaviour of the base tag).
++        // `ver` (the first stage's verifier) is NOT wrapped: it reads its device from the current one, which must
++        // stay the primary context's.
++        const int draft_dev = last_st ? last_st->dev : -1;
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
+-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+-            (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+-                                  pipe ? pl_mtp_R : ver.final_R_all(), err))) {
++                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err)) {
+             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+             return 1;
+         }
++        if (use_mtp) {
++            const strata::core::OnDevice on_draft(draft_dev);
++            if (!mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
++                          pipe ? pl_mtp_R : ver.final_R_all(), err)) {
++                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
++                return 1;
++            }
++        }
+         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+-        auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
+-        std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
++        // the slot rows' buffers belong to the drafter's device: allocated and freed with it current (the deleter
++        // runs outside this scope's OnDevice, so it carries the device itself)
++        struct SlotRowFree {
++            int dev = -1;
++            void operator()(float* p) const {
++                if (p == nullptr) return;
++                const strata::core::OnDevice on_d(dev);
++                (void) cudaFree(p);
++            }
++        };
++        std::vector<std::unique_ptr<float, SlotRowFree>> slot_mtp_rows;
+         if (batch_mtp) {
++            const strata::core::OnDevice on_draft(draft_dev);
+             for (int b = 0; b < o.batch; ++b) {
+                 float* r = nullptr;
+                 const size_t bytes = (size_t) o.spec * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
+@@ -6305,12 +6375,14 @@ int main(int argc, char** argv) {
+                                  b, vram_free_note().c_str());
+                     return 1;
+                 }
+-                slot_mtp_rows.emplace_back(r, free_slot_mtp_rows);
+-                if (!slot_mtp[(size_t) b]->bind(wt, &native_head, r, err, &mtp)) {
++                // the slot drafter binds the head's stage's weights and head, exactly as the main one does above
++                if (!slot_mtp[(size_t) b]->bind(last_st ? last_st->wt : wt,
++                                                last_st ? &last_st->head : &native_head, r, err, &mtp)) {
+                     std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
+                                  vram_free_note().c_str());
+                     return 1;
+                 }
++                slot_mtp_rows.emplace_back(r, SlotRowFree{draft_dev});
+             }
+         }
+         // each stage's verifier gets its stage's slot sessions
+@@ -7714,7 +7786,9 @@ int main(int argc, char** argv) {
+                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+             }
+             if (batch_mtp) {
+-                // Admission first builds the solo draft KV; copy it into the slot before drafting.
++                // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters
++                // live on the head's stage's device under a layer split: the copy runs with it current.
++                const strata::core::OnDevice on_draft(draft_dev);
+                 strata::core::ConversationKv image;
+                 if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
+                     !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+@@ -7758,7 +7832,8 @@ int main(int argc, char** argv) {
+                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+             }
+             if (batch_mtp) {
+-                // A returning solo request resumes from its slot's draft KV.
++                // A returning solo request resumes from its slot's draft KV (on the head's stage's device).
++                const strata::core::OnDevice on_draft(draft_dev);
+                 strata::core::ConversationKv image;
+                 if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
+                     !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+@@ -7862,6 +7937,10 @@ int main(int argc, char** argv) {
+                     sl.p += 1;
+                 }
+                 if (batch_mtp && sl.active) {
++                    // DELTA 3: under a layer split `ver.final_R_all()` is the LAST stage's residual (it chains
++                    // through the pipeline) and the slot's drafter is on that stage's device: the D2D copy and the
++                    // draft run with it current.  One GPU: draft_dev -1, a no-op.
++                    const strata::core::OnDevice on_draft(draft_dev);
+                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                     if (cudaMemcpy(slot_mtp_rows[(size_t) b].get(),
+                                    ver.final_R_all() + (size_t) first[t] * stride,
+diff --git a/tests/core/stage_plan_test.cpp b/tests/core/stage_plan_test.cpp
+new file mode 100644
+index 0000000..b6c404f
+--- /dev/null
++++ b/tests/core/stage_plan_test.cpp
+@@ -0,0 +1,151 @@
++// tests/core/stage_plan_test.cpp - delta 3 (layer/series): the two pure decisions the delta touches, exercised
++// host-only (no CUDA, no GPU, no model):
++//
++//   1. `batch_mtp_reason` - why --batch-mtp is left off.  The delta lifts the "one GPU" refusal, so the cases
++//      below pin BOTH ends: every missing requirement still refuses with its own line, a layer split is accepted,
++//      and the one-GPU answers are byte-identical to the base tag's (the layer is inert by default).
++//   2. `order_with_head_device` - which device runs the output head and the MTP draft layer (--head-device).
++//      -1 (the flag absent) must return the order UNCHANGED: that is the negative the delta asks for (with a
++//      layer split and without the flag the engine behaves exactly as before).  A requested device that cannot
++//      be reached is refused with a reason and leaves the order alone (recommend, never force), including the
++//      primary device of a split, which runs the first stage and cannot host the head.
++//
++// The test links nothing but the header: it is built by STRATA_BUILD_CONVERSATION_TESTS alongside the other
++// host-only tests (see _host_build.bat).
++#include "strata/core/stage_plan.hpp"
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++using strata::core::batch_mtp_reason;
++using strata::core::head_stage_of;
++using strata::core::order_with_head_device;
++
++namespace {
++
++int g_fail = 0;
++int g_checks = 0;
++
++void check(bool ok, const std::string& what) {
++    ++g_checks;
++    std::printf("  %-88s %s\n", what.c_str(), ok ? "ok" : "FAIL");
++    if (!ok) ++g_fail;
++}
++
++const char* reason(int batch, bool mtp, int spec, bool serve, bool same, size_t n_stages) {
++    return batch_mtp_reason(batch, mtp, spec, serve, same, n_stages);
++}
++
++std::string vec_s(const std::vector<int>& v) {
++    std::string s = "[";
++    for (size_t i = 0; i < v.size(); ++i) s += (i == 0 ? "" : ",") + std::to_string(v[i]);
++    return s + "]";
++}
++
++}  // namespace
++
++int main() {
++    std::printf("stage_plan: batch-MTP eligibility\n");
++    // ---- every missing requirement still refuses, with its own line (unchanged from the base tag)
++    check(std::string(reason(0, true, 4, true, false, 1)) == "it needs --batch 2 or more",
++          "no --batch: refused");
++    check(std::string(reason(3, false, 4, true, false, 1)) == "it needs --mtp", "no --mtp: refused");
++    check(std::string(reason(3, true, 1, true, false, 1)) == "it needs --spec T (T >= 2)",
++          "no --spec T>=2: refused");
++    check(std::string(reason(3, true, 4, false, false, 1)) == "it needs --serve", "no --serve: refused");
++    check(std::string(reason(3, true, 4, true, true, 2)) ==
++              "it needs each stage of a layer split on its own GPU",
++          "--split-device 0 (same device stages): refused");
++    // ---- the one-GPU case the base tag allowed: still allowed, unchanged
++    check(reason(4, true, 4, true, false, 1) == nullptr,
++          "one GPU, everything present: allowed (base tag unchanged)");
++    // ---- DELTA 3: a layer split (2, 3 and 4 stages, each on its own GPU) is allowed too
++    check(reason(4, true, 4, true, false, 2) == nullptr, "layer split, 2 stages: allowed");
++    check(reason(8, true, 4, true, false, 3) == nullptr, "layer split, 3 stages: allowed");
++    check(reason(8, true, 4, true, false, 4) == nullptr, "layer split, 4 stages: allowed");
++    // ---- and a split still refuses when a requirement is missing (the split is not an exemption)
++    check(reason(4, false, 4, true, false, 3) != nullptr, "layer split without --mtp: refused");
++    check(reason(1, true, 4, true, false, 3) != nullptr, "layer split with one slot: refused");
++    check(reason(4, true, 4, false, false, 3) != nullptr, "layer split without --serve: refused");
++    check(reason(4, true, 4, true, true, 3) != nullptr, "split on one device with 3 stages: refused");
++    // the answer does not depend on the stage count beyond the split itself
++    check(reason(4, true, 4, true, false, 1) == reason(4, true, 4, true, false, 5),
++          "one GPU and five stages agree (no split-shaped condition left in the rule)");
++
++    std::printf("stage_plan: the head's stage\n");
++    check(head_stage_of(1) == 0, "one stage: the head is stage 0");
++    check(head_stage_of(2) == 1, "two stages: the head is the last (stage 1)");
++    check(head_stage_of(4) == 3, "four stages: the head is the last (stage 3)");
++    check(head_stage_of(0) == 0, "no stage: stage 0 (degenerate, never reached)");
++
++    std::printf("stage_plan: --head-device\n");
++    bool ok = false;
++    std::string why;
++
++    // ---- the flag absent (-1): the order is returned exactly as it came.  This is the delta's negative: with a
++    // layer split and no --head-device the engine is the base tag's.
++    for (const std::vector<int>& v : {std::vector<int>{0}, std::vector<int>{0, 1},
++                                      std::vector<int>{0, 1, 2}, std::vector<int>{0, 2, 3}}) {
++        ok = false;
++        why.clear();
++        const std::vector<int> out = order_with_head_device(v, -1, ok, why);
++        check(ok && out == v && why.empty(),
++              "no --head-device: " + vec_s(v) + " unchanged (" + vec_s(out) + ")");
++    }
++
++    // ---- a request that is already the last stage's device: no reorder, no complaint
++    ok = false;
++    check(order_with_head_device({0, 1}, 1, ok, why) == std::vector<int>{0, 1} && ok && why.empty(),
++          "2 GPUs, --head-device 1 (already last): unchanged");
++    ok = false;
++    check(order_with_head_device({0}, 0, ok, why) == std::vector<int>{0} && ok,
++          "one GPU, --head-device 0: unchanged");
++    ok = false;
++    check(order_with_head_device({0, 1}, 0, ok, why) == std::vector<int>{0, 1} && !ok && !why.empty(),
++          "2 GPUs, --head-device 0 (the primary): refused with a reason");
++
++    // ---- a request the pipeline can reach: that device goes last, the others keep their order
++    ok = false;
++    why.clear();
++    std::vector<int> out = order_with_head_device({0, 1, 2}, 1, ok, why);
++    check(ok && why.empty() && out == std::vector<int>{0, 2, 1},
++          "3 GPUs, --head-device 1: later stages reorder to " + vec_s(out) + " (the head moves to CUDA1)");
++    check(!out.empty() && out.back() == 1, "3 GPUs, --head-device 1: the requested device is last");
++    ok = false;
++    out = order_with_head_device({0, 1, 2, 3}, 2, ok, why);
++    check(ok && out == std::vector<int>{0, 1, 3, 2} && out.back() == 2,
++          "4 GPUs, --head-device 2: reorder to " + vec_s(out));
++    // the primary device always keeps the first stage (it is the prompt path's)
++    for (const std::vector<int>& v : {std::vector<int>{0, 1}, std::vector<int>{0, 1, 2}}) {
++        for (int req = 1; req < (int) v.size(); ++req) {
++            ok = false;
++            const std::vector<int> o = order_with_head_device(v, req, ok, why);
++            if (!ok || o.empty() || o[0] != 0) {
++                check(false, "the primary device stays first for " + vec_s(v) + " req " + std::to_string(req));
++            }
++        }
++    }
++    check(true, "the primary device stays first whenever a request is honoured");
++
++    // ---- a request nothing can honour: unchanged, said
++    ok = true;
++    why.clear();
++    out = order_with_head_device({0, 1}, 2, ok, why);
++    check(!ok && out == std::vector<int>{0, 1} && why.find("2") != std::string::npos,
++          "2 GPUs, --head-device 2 (not in the pipeline): refused, order kept");
++    ok = true;
++    out = order_with_head_device({0}, 1, ok, why);
++    check(!ok && out == std::vector<int>{0}, "one GPU, --head-device 1: refused, order kept");
++    ok = true;
++    out = order_with_head_device({}, 0, ok, why);
++    check(ok && out.empty(), "no devices: nothing to order");
++    // the primary refusal names the way out (the card order), which is what the user is pointed at
++    ok = false;
++    (void) order_with_head_device({0, 1}, 0, ok, why);
++    check(!ok && why.find("primary") != std::string::npos && why.find("order the cards") != std::string::npos,
++          "the primary refusal says why and names the card order as the way to move the head");
++
++    std::printf("stage_plan: %d checks, %d failed\n", g_checks, g_fail);
++    return g_fail == 0 ? 0 : 1;
++}
+diff --git a/tools/test_setup_head_device.py b/tools/test_setup_head_device.py
+new file mode 100644
+index 0000000..2432f76
+--- /dev/null
++++ b/tools/test_setup_head_device.py
+@@ -0,0 +1,103 @@
++"""delta 3 (layer): setup's head's card - the ranking by TIME (SMs x clock, the engine's own per-layer model) and
++the card order that puts the head there.  No GPU and no engine: the probe is stubbed.
++    python tools/test_setup_head_device.py
++"""
++import sys
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
++import setup as S  # noqa: E402
++
++
++# two cards of the machine this was written on, and a third so the ranking has something to reorder
++FAST = {"index": 0, "name": "NVIDIA GeForce RTX 4080 SUPER", "vram_gb": 16.0, "arch": "89"}
++BIG_SLOW = {"index": 1, "name": "NVIDIA GeForce RTX 3090", "vram_gb": 24.0, "arch": "86"}
++SMALL_SLOW = {"index": 2, "name": "NVIDIA GeForce RTX 3060", "vram_gb": 12.0, "arch": "86"}
++
++# what the probe answers for each card: (SMs, GHz) - the two inputs of the engine's layer model
++PROBES = {0: (76, 2.61), 1: (82, 1.70), 2: (28, 1.78)}
++
++
++def with_probe(cards):
++    """`cards` with gpu_layer_ms stubbed by PROBES (and by index, so the order does not matter)."""
++    orig = S.gpu_layer_ms
++    S.gpu_layer_ms = lambda g, toolkit=13: (S.HEAD_MS_FIT / (PROBES[g["index"]][0] * PROBES[g["index"]][1])
++                                            if g["index"] in PROBES else None)
++    return orig
++
++
++class HeadDevice(unittest.TestCase):
++    def setUp(self):
++        self.orig = with_probe(PROBES)
++
++    def tearDown(self):
++        S.gpu_layer_ms = self.orig
++
++    def test_ms_is_the_engines_own_model(self):
++        # 0.33 * 84 * 2.617 / (SMs x GHz): the constant the layer-split search was fitted with
++        ms = S.gpu_layer_ms(FAST)
++        self.assertAlmostEqual(ms, S.HEAD_MS_FIT / (76 * 2.61), places=6)
++        self.assertLess(ms, S.gpu_layer_ms(BIG_SLOW))          # the 4080 is the faster card per layer
++        self.assertLess(S.gpu_layer_ms(BIG_SLOW), S.gpu_layer_ms(SMALL_SLOW))
++
++    def test_the_head_card_is_chosen_by_time_not_by_vram(self):
++        # the card with the most VRAM is the SLOWEST: it must not win the head
++        pick = S.head_card_by_time([FAST, BIG_SLOW, SMALL_SLOW])
++        self.assertEqual(pick["index"], 0)
++        self.assertGreater(pick["vram_gb"], 0)
++        self.assertLess(FAST["vram_gb"], BIG_SLOW["vram_gb"])   # ... and it has less VRAM: that is the point
++        # nothing to time: None, and setup keeps what it had
++        orig = S.gpu_layer_ms
++        S.gpu_layer_ms = lambda g, toolkit=13: None
++        self.assertIsNone(S.head_card_by_time([FAST, BIG_SLOW]))
++        S.gpu_layer_ms = orig
++
++    def test_ties_keep_the_placement_the_engine_would_make(self):
++        orig = S.gpu_layer_ms
++        S.gpu_layer_ms = lambda g, toolkit=13: 0.5
++        self.assertEqual(S.head_card_by_time([FAST, BIG_SLOW])["index"], BIG_SLOW["index"])   # the LAST of the two
++        S.gpu_layer_ms = orig
++
++    def test_the_config_order_puts_the_head_last(self):
++        # --head-device N: that card goes last, the others keep their order, and the config says which one it is
++        cfg = {"gpu": [0, 1, 2]}
++        S.apply_head_device(cfg, "0", [FAST, BIG_SLOW, SMALL_SLOW])
++        self.assertEqual(cfg["gpu"], [1, 2, 0])
++        self.assertEqual(cfg["head_device"], 0)
++        # auto: the fastest per layer, which is the same card here
++        cfg = {"gpu": [1, 0, 2]}
++        S.apply_head_device(cfg, "auto", [FAST, BIG_SLOW, SMALL_SLOW])
++        self.assertEqual(cfg["head_device"], 0)
++        self.assertEqual(cfg["gpu"], [1, 2, 0])
++
++    def test_not_asked_moves_nothing(self):
++        cfg = {"gpu": [0, 1]}
++        S.apply_head_device(cfg, None, [FAST, BIG_SLOW])
++        self.assertEqual(cfg["gpu"], [0, 1])
++        self.assertNotIn("head_device", cfg)
++        # ... and a single card has nowhere to put the head (said, nothing moved)
++        cfg = {"gpu": 0}
++        S.apply_head_device(cfg, "auto", [FAST])
++        self.assertEqual(cfg["gpu"], 0)
++        self.assertNotIn("head_device", cfg)
++
++    def test_the_note_names_the_way_to_move_it(self):
++        lines = S.head_device_note([FAST, BIG_SLOW])
++        self.assertTrue(any("ms/layer" in x for x in lines))
++        self.assertTrue(any("--head-device 0" in x or '"head_device": 0' in x for x in lines))
++        # already where the estimate wants it: no "move it" line
++        self.assertEqual(len(S.head_device_note([BIG_SLOW, FAST])), 2)
++        self.assertEqual(S.head_device_note([FAST]), [])
++
++    def test_no_estimate_says_so(self):
++        orig = S.gpu_layer_ms
++        S.gpu_layer_ms = lambda g, toolkit=13: None
++        lines = S.head_device_note([FAST, BIG_SLOW])
++        self.assertEqual(len(lines), 1)
++        self.assertIn("could not be estimated", lines[0])
++        S.gpu_layer_ms = orig
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+-- 
+2.53.0.windows.2
+
