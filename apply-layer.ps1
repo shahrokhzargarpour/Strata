@@ -18,6 +18,9 @@ param(
   [Parameter(Mandatory=$true)][string]$Tag,
   [Parameter(Mandatory=$true)][string]$Dst,
   [string]$Patches = (Join-Path $PSScriptRoot 'patches'),
+  # Contra que se comprueba la paridad: la rama de la serie (default) o un punto CONGELADO
+  # (p.ej. -Serie bea20c9 para la entrega del delta 2, que NO debe medirse contra la rama que siguio creciendo).
+  [string]$Serie = 'layer/series',
   [switch]$SkipParity
 )
 
@@ -53,34 +56,33 @@ foreach ($p in $patchFiles) {
 }
 Pop-Location
 
-Write-Host "--- paridad de arbol exacta contra la rama de la serie ---"
-# Que el arbol aplicado sea EXACTAMENTE la rama que se entrega (layer/series), no solo "las anclas siguen ahi":
-# se trae la rama de este repo al clon y se compara.  Una diferencia es fallo: significa que patches/ no
-# reproduce la serie (un commit sin exportar, un archivo de mas, o un parche que aplico distinto).
-$serie = 'layer/series'
+Write-Host "--- paridad de arbol exacta contra '$Serie' ---"
+# Que el arbol aplicado sea EXACTAMENTE el punto que se entrega, no solo "las anclas siguen ahi": se comparan
+# los HASHES DE ARBOL.  Una diferencia es fallo: significa que patches/ no reproduce ese punto (un commit sin
+# exportar, un archivo de mas, o un parche que aplico distinto).  Con -Serie se mide contra un commit congelado,
+# que es lo correcto para una entrega: la rama de trabajo sigue creciendo despues del congelado.
 $serieOk = $false
-git -C $PSScriptRoot rev-parse --verify --quiet $serie | Out-Null
+$treeRef = git -C $PSScriptRoot rev-parse --verify --quiet "$Serie^{tree}"
 if ($LASTEXITCODE -ne 0) {
-  Write-Host "  [aviso] este repo no tiene la rama ${serie}: no puedo comprobar paridad (corre -SkipParity para saltarla)"
+  Write-Host "  [aviso] este repo no tiene la referencia '$Serie': no puedo comprobar paridad (corre -SkipParity para saltarla)"
 } else {
-  git -C $Dst fetch --quiet $PSScriptRoot "refs/heads/${serie}:refs/remotes/layer/series"
-  if ($LASTEXITCODE -ne 0) { Write-Host "  [FALLA] no pude traer $serie al clon" }
+  $treeDst = git -C $Dst rev-parse 'HEAD^{tree}'
+  $dirty = git -C $Dst status --porcelain
+  $serieOk = ($treeDst -eq $treeRef) -and (-not $dirty)
+  if ($serieOk) { Write-Host "  [ok]    el arbol aplicado es IDENTICO a '$Serie' ($treeDst)" }
   else {
-    $dirty = git -C $Dst status --porcelain
-    git -C $Dst diff --quiet 'refs/remotes/layer/series' -- .
-    $serieOk = ($LASTEXITCODE -eq 0) -and (-not $dirty)
-    if ($serieOk) { Write-Host "  [ok]    el arbol aplicado es identico a $serie (HEAD $(git -C $Dst rev-parse --short HEAD))" }
-    else {
-      Write-Host "  [FALLA] el arbol aplicado NO es identico a ${serie}:"
-      if ($dirty) { $dirty | ForEach-Object { Write-Host "     sin commitear: $_" } }
-      git -C $Dst diff --stat 'refs/remotes/layer/series' -- . | ForEach-Object { Write-Host "     $_" }
-    }
+    Write-Host "  [FALLA] el arbol aplicado NO coincide con '$Serie':"
+    Write-Host "     arbol aplicado : $treeDst"
+    Write-Host "     arbol esperado : $treeRef"
+    if ($dirty) { $dirty | ForEach-Object { Write-Host "     sin commitear: $_" } }
+    git -C $Dst diff --stat $treeRef -- . | ForEach-Object { Write-Host "     $_" }
   }
 }
 if (-not $serieOk -and -not $SkipParity) {
   Write-Host ""
   Write-Host "=== apply-layer: PARIDAD DE ARBOL FALLIDA. No uses este arbol: regenera patches/ con"
-  Write-Host "    git format-patch v<tag>..layer/series -o patches y volve a correrlo. ==="
+  Write-Host "    git format-patch v<tag>..<la referencia que se entrega> -o patches y volve a correrlo."
+  Write-Host "    Si estas midiendo una entrega CONGELADA, pasa -Serie <commit>: la rama de trabajo ya crecio. ==="
   exit 1
 }
 
