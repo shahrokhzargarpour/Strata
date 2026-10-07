@@ -1,0 +1,1135 @@
+From bea20c98d20dc68d23b81d006ad52372636b7ed5 Mon Sep 17 00:00:00 2001
+From: Shahrokh <design@cariblanco.best>
+Date: Wed, 7 Oct 2026 00:18:13 -0600
+Subject: [PATCH 10/10] disk tier: --conversation-cache-spill-on park (a mirror
+ at the park), compaction and cancellation
+
+The disk tier stops being only overflow. With the tier on, --conversation-cache-spill-on defaults to park: the state the request ends with (the park) is written then, by an async writer that keeps one cell per conversation holding only the newest state, so a turn with five tool calls writes once. evict is the opt-out and reproduces delta 1 byte for byte; without a spill directory both are inert.
+
+A stored copy whose header still matches but whose common prefix with the incoming prompt is shorter than --conversation-cache-spill-divergence-tokens is a rewritten tail (a compaction or an edited history): it is discarded, not left orphaned. A request the client cancels leaves a provisional state: the live ids revert to the last --turn-token boundary, no durable copy is published of it, and the previous one is left alone.
+
+Host tests: conversation_spill_test 102 -> 169 checks. Flags: --conversation-cache-spill-on, --conversation-cache-spill-divergence-tokens, --conversation-cache-spill-park-throttle-s.
+---
+ docs/FLAGS.md                              |  18 +-
+ docs/SPILL_AND_PROMPT_CACHE.md             |  68 ++++--
+ include/strata/core/conversation_spill.hpp | 269 +++++++++++++++++++--
+ src/core/conversation_spill.cpp            |  45 +++-
+ src/core/conversation_spill_test.cpp       | 242 ++++++++++++++++++
+ src/program/generate.cpp                   | 135 ++++++++++-
+ 6 files changed, 733 insertions(+), 44 deletions(-)
+
+diff --git a/docs/FLAGS.md b/docs/FLAGS.md
+index 901e089..9181d4a 100644
+--- a/docs/FLAGS.md
++++ b/docs/FLAGS.md
+@@ -12,7 +12,8 @@ cache").
+ ## How to read the "Since" column
+ 
+ - **`layer/base`** — this tree's base: upstream `v0.1.40.1` plus PR #1271 (the disk tier) and PR #1269.
+-- **`layer/delta1`** — this tree's own work on top of that base.
++- **`layer/delta1`** — this tree's own work on top of that base (the spill tier as overflow).
++- **`layer/delta2`** — the mirror at the park, compaction detection and cancellation (on top of delta 1).
+ - **`engine <version>`** — the flag came from upstream and is unchanged here.
+ 
+ ## Three caches, not one
+@@ -22,9 +23,11 @@ Do not mix these. They share the word "cache" and little else:
+ 1. **The parked conversations in RAM** (`--conversation-cache-mib`, `--conversation-cache-slots`,
+    `--conversation-cache-min-free-mib`; upstream engine). Conversations the engine keeps in host RAM between
+    requests, so a returning chat does not read its prompt again. RAM only: lost on restart.
+-2. **The disk tier** (`--conversation-cache-spill-dir` + `--conversation-cache-disk-mib` + the three flags beside
+-   them). A conversation the RAM cache evicts is written to a folder as an ordinary session file, and read back
+-   later or after a restart.
++2. **The disk tier** (`--conversation-cache-spill-dir` + `--conversation-cache-disk-mib` + the flags beside
++   them). A conversation is written to a folder as an ordinary session file and read back later or after a restart.
++   By default (`--conversation-cache-spill-on park`) it is a **mirror**: the state parked at the end of a request
++   is written then. With `--conversation-cache-spill-on evict` it is **overflow**: only a conversation the RAM cache
++   evicts reaches disk.
+ 3. **The system-prompt prefill cache** (`--system-prompt-cache*`). The checkpoint root that ends the system prompt
+    (`--prompt-cache-root`, in RAM) is persisted to its own folder as a session file and reloaded at start.
+ 
+@@ -35,12 +38,19 @@ the system-prompt cache persists; `--prompt-cache-root` is the threshold for the
+ 
+ ## A. The disk tier (conversations on disk)
+ 
++The disk tier has two modes, selected by `--conversation-cache-spill-on` and detailed in the table below: the
++default **mirror** (`park`, when the tier is on) writes the conversation at the park, and the **overflow** opt-out
++(`evict`) reproduces delta 1 byte for byte. Without `--conversation-cache-spill-dir` both are inert.
++
+ | Flag | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
+ | --- | --- | --- | --- | --- | --- |
+ | `--conversation-cache-spill-dir DIR` | empty (off) | Turns the disk tier on and names its folder. A conversation the RAM cache evicts is written there as an ordinary session file (`.sess`) plus a small sidecar (`.meta`). | `--serve` only. Needs `--conversation-cache-mib > 0`, `--prompt-cache > 0`, `--conversation-cache-slots > 0` and a nonzero `--conversation-cache-disk-mib`; otherwise the engine warns and the tier stays off. Works with `--layer-split` (one file per stage). | No authentication: the files hold the conversation's token IDs and state, so the folder must stay private. A file from another model or another configuration (including another KV quant) is **rejected, not reused**. | `layer/base` (`v0.1.40.1` + PR #1271) |
+ | `--conversation-cache-disk-mib N` | 8192 | The spill folder's byte budget, in MiB. The GC removes stored conversations over it, oldest first. | `--serve`; inside the disk tier. `0` disables the disk tier. This is the tier's own folder, not `--conversation-cache-mib`, which is the RAM budget. | A budget, not a disk reservation or a quota. A stored conversation larger than the whole budget is kept anyway (removing it could not bring the folder under the budget) and counted as `oversized`. | `layer/base` |
+ | `--conversation-cache-spill-when-full MODE` | `evict-oldest` | What the GC does at the budget. `evict-oldest` drops the oldest stored conversation to make room (what the tier always did). `reject` stores nothing new and removes nothing. | `--serve`; only inside the disk tier. An unknown mode is refused at start. | `reject` does not bound the folder in any other way: a folder already over budget stops accepting spills and keeps what is there. The age lever below is independent of this. | `layer/delta1` |
+ | `--conversation-cache-spill-max-age-days N` | 0 (off) | Optional age pruning. With a positive N, the GC removes stored conversations older than N days, oldest first, counted separately from the budget GC. | `--serve`; only inside the disk tier. `0` means **no deletion by time at all**: this lever is off unless set. | Off by default. Independent of `--conversation-cache-spill-when-full`: both can act, each with its own counter in the log. | `layer/delta1` |
++| `--conversation-cache-spill-on MODE` | **`park`** | What the tier is there for. `park` (the default **when the tier is on**: a spill directory and a nonzero budget) also writes a conversation the moment it is parked at the end of a request, so a close loses at most the request in flight. `evict` is the delta-1 behaviour: only what the RAM cache evicts reaches disk. | `--serve`; inside the disk tier. **The default changes with the tier**: without `--conversation-cache-spill-dir` neither mode does anything (no folder, no byte). An unknown mode is refused at start. | The mirror writes at the end of each request, never mid-generation, and collapses a burst of parks of one conversation (one cell per conversation holding only the newest state; the async writer drains it). The disk is bounded by `--conversation-cache-disk-mib` exactly as before. | `layer/delta2` |
++| `--conversation-cache-spill-divergence-tokens N` | 4096 | A stored copy whose common prefix with the incoming prompt is shorter than N tokens, while its header (system prompt + first turn) still matches, is read as a **rewritten tail** — a compaction or an edited history — and is **discarded** (index and file) instead of being kept as an orphan. Counted in `compacted`. | `--serve`; inside the disk tier. Needs a turn token (`--turn-token`); without one nothing is ever called a rewrite. A copy the prompt **extends** is kept; one whose header differs is another conversation and is left alone. | A threshold, not a measurement: a compaction that keeps more than N tokens of common prefix is not detected and the copy is left for the GC. Prevents a compacted copy from occupying GB while it can never be a hit. | `layer/delta2` |
++| `--conversation-cache-spill-park-throttle-s N` | 0 | In `park` mode, do not rewrite the same conversation inside an N-second window; the park is postponed to a later one. | `--serve`; inside the disk tier, `park` mode only. `0` = write on every park. | A rate limiter, not a correctness lever: the newest state still ends up on disk, just on the next park outside the window. Counted in `throttled`. | `layer/delta2` |
+ | `--conversation-cache-similarity F` | 0.0 | The least fraction of the new prompt that a stored (RAM or disk) conversation must share as a common prefix before it may be reused. | `--serve`; applies to the RAM cache and the disk tier's match. A finite number in `[0, 1)`; anything else is refused. | 0 accepts any match. It filters weak hits only: a candidate that passes still has to be an exact token/image prefix to be restored. | `layer/base` |
+ | `--conversation-cache-n-min N` | 0 | The least number of common-prefix tokens a stored conversation must offer before it may be reused. | `--serve`; same place as `--conversation-cache-similarity` (RAM and disk). | 0 accepts any length. A hit that offers fewer tokens than a live slot or the RAM cache already reaches is not used. | `layer/base` |
+ 
+diff --git a/docs/SPILL_AND_PROMPT_CACHE.md b/docs/SPILL_AND_PROMPT_CACHE.md
+index 87aad45..9b3649b 100644
+--- a/docs/SPILL_AND_PROMPT_CACHE.md
++++ b/docs/SPILL_AND_PROMPT_CACHE.md
+@@ -9,10 +9,16 @@ upstream. Every flag is listed in [FLAGS.md](FLAGS.md).
+ 
+ A long chat that comes back after a few turns is not free: the engine has to hold, or re-read, the history in
+ front of the new message. Upstream keeps that in host RAM (`--conversation-cache-mib`), but the RAM cache is
+-bounded and does not survive a restart. The disk tier closes that gap: when the RAM cache evicts a conversation it
+-is written to a folder as an ordinary session file, and a later request — or a restart — reads it back instead of
+-reading the whole prompt again. The file is the same format the manual slot save/restore API writes, so a spilled
+-conversation and a hand-saved one are interchangeable.
++bounded and does not survive a restart. The disk tier closes that gap: a conversation is written to a folder as an
++ordinary session file, and a later request — or a restart — reads it back instead of reading the whole prompt
++again. The file is the same format the manual slot save/restore API writes, so a spilled conversation and a
++hand-saved one are interchangeable.
++
++The tier has two modes (`--conversation-cache-spill-on`). The default, **mirror** (`park`), writes the state the
++moment a request ends and its session is parked, so an abrupt close loses at most the request in flight. The
++opt-out, **overflow** (`evict`), is the delta-1 behaviour: only a conversation the RAM cache evicts reaches disk.
++In both modes the folder holds **one copy per conversation**, and the copy is only replaced once its successor is
++on disk.
+ 
+ The system prompt in front of every chat is (for one client) the same on every new chat, and it can be thousands
+ of tokens. Re-reading it costs time on the first request of each chat. The system-prompt cache persists the
+@@ -22,28 +28,52 @@ prefix, never a conversation tail.
+ ## Slot lifecycle
+ 
+ A slot is one request's state. When its turn ends the state is parked; the RAM cache holds it, and the disk tier
+-catches what the RAM cache drops.
++mirrors it (default) or catches what the RAM cache drops (`evict`). The write happens when a request **ends**,
++never mid-generation, and a burst of parks of one conversation collapses to its newest state: one cell per
++conversation, drained by one background writer.
+ 
+ ```mermaid
+ flowchart TD
+     A["Turn ends: state in VRAM / host RAM"] --> B{"Fits the RAM cache budget?"}
+     B -->|yes| C["Parked in RAM"]
+     B -->|no| D["Evicted: spill to disk"]
+-    D --> E["One session file per stage (.sess) + one sidecar (.meta), written to a temp name then renamed"]
+-    C --> F["Next prefill: match in RAM (no disk read)"]
++    C --> M{"spill-on park (default)?"}
++    M -->|yes| N["One cell per conversation (newest state) -> async writer"]
++    M -->|no -- evict| P["Nothing yet: the disk tier is overflow"]
++    N --> E["One session file per stage (.sess) + one sidecar (.meta), written to a temp name then renamed"]
++    N --> Q["Superseded copies dropped AFTER the new one lands: one copy per conversation"]
++    D --> E
+     E --> G["Next prefill: match from the sidecars only (no K/V read)"]
++    C --> F["Next prefill: match in RAM (no disk read)"]
+     G --> H{"Identity and prefix valid?"}
+     H -->|no| I["Rejected clean: ignored and counted, never deleted"]
+-    H -->|yes| J["Validate header and hash, load, grow or compact"]
+-    J --> K["Re-spill on a later eviction: atomic replacement (temp + rename)"]
++    H -->|yes| R{"Client rewrote the tail (compaction)?"}
++    R -->|yes, header intact and prefix < --conversation-cache-spill-divergence-tokens| S["Discard the copy: compacted, not left orphaned"]
++    R -->|no| J["Validate header and hash, load, grow or compact"]
++    J --> K["Re-park / re-evict: atomic replacement (temp + rename)"]
+     K --> E
+     D --> L["GC: the only thing that deletes"]
+-    L --> M["By space: over --conversation-cache-disk-mib, oldest first"]
+-    M --> N{"Is the age lever on?"}
+-    N -->|yes| O["By age too: oldest first"]
+-    N -->|no| P["No deletion by time at all"]
++    L --> T["By space: over --conversation-cache-disk-mib, oldest first"]
++    T --> U{"Is the age lever on?"}
++    U -->|yes| V["By age too: oldest first"]
++    U -->|no| W["No deletion by time at all"]
++    A --> X{"Request cancelled? (the engine's '(cancelled)')"}
++    X -->|yes| Y["Provisional: revert the live ids to the last turn boundary; publish nothing; previous copy untouched"]
+ ```
+ 
++**Compaction.** The sidecar carries the conversation's own token ids, so the check needs no K/V. A stored copy
++whose common prefix with the incoming prompt is shorter than `--conversation-cache-spill-divergence-tokens`
++(4096 by default) **while its header still matches** describes a history the client has rewritten (a compaction or
++an edited history): it can never be a hit, so it is discarded — index and file — and counted (`compacted`). A copy
++the prompt extends is the normal turn and is kept; a copy whose header differs is another conversation and is left
++alone.
++
++**Cancellation.** A request the client aborts (Escape-Escape in a TUI) ends with the engine's own `(cancelled)`
++line. That state is provisional: the live ids are reverted to the last turn boundary the read actually reached
++(`--turn-token`), no durable copy is published of it, and the previous good copy is left exactly as it was — it is
++the prefix the client resends on the retry. The harness does not matter: the decision uses only the turn token and
++the engine's cancellation signal.
++
+ ## Prefill decision tree
+ 
+ A new prompt is first offered to the live slots and the RAM cache; only then to the disk tier. A disk match is
+@@ -93,8 +123,12 @@ flowchart TD
+ 
+ - Disk tier: `--conversation-cache-spill-dir DIR`, with `--conversation-cache-mib > 0`, `--prompt-cache > 0`,
+   `--conversation-cache-slots > 0` and a nonzero `--conversation-cache-disk-mib` (default 8192 MiB).
++  `--conversation-cache-spill-on` chooses `park` (default once the tier is on: a mirror, written at the park) or
++  `evict` (the delta-1 overflow);
+   `--conversation-cache-spill-when-full` chooses `evict-oldest` (default) or `reject`;
+-  `--conversation-cache-spill-max-age-days` adds optional age pruning (0 = off).
++  `--conversation-cache-spill-max-age-days` adds optional age pruning (0 = off);
++  `--conversation-cache-spill-divergence-tokens` (4096) and `--conversation-cache-spill-park-throttle-s` (0) tune
++  the compaction check and the rewrite rate.
+ - System-prompt cache: `--system-prompt-cache` with `--system-prompt-cache-dir DIR`. It also needs
+   `--prompt-cache > 0`, `--prompt-cache-root > 0`, a turn token and `--mtp` (without MTP the feature reports
+   itself off rather than capturing a different artifact). Its folder is separate from the spill folder.
+@@ -114,7 +148,11 @@ shows their counters under `/metrics` in `conversation_cache` (`disk` and `syste
+ - The scan never deletes. A file of another identity, a broken or missing sidecar, an orphan session file and a
+   leftover temporary are ignored and counted (`foreign`, `stale`, `orphan`), never removed. Only the GC removes,
+   by budget and (if enabled) by age, oldest first.
+-- Nothing is written with the flags absent: no folder is created and no byte is written.
++- Nothing is written with the flags absent: no folder is created and no byte is written. The mirror writes at the
++  **end of a request** (the park), never mid-generation, and collapses a burst of parks of one conversation to its
++  newest state; the disk cost is bounded by `--conversation-cache-disk-mib` either way.
++- The **mirror** pays a host copy of the parked image per park (the writer owns its own copy, so the RAM cache's
++  entry is never aliased). The copy is synchronous at the park; the disk write itself is asynchronous.
+ 
+ ## Validation environment
+ 
+diff --git a/include/strata/core/conversation_spill.hpp b/include/strata/core/conversation_spill.hpp
+index 277d784..56bcfc5 100644
+--- a/include/strata/core/conversation_spill.hpp
++++ b/include/strata/core/conversation_spill.hpp
+@@ -14,10 +14,15 @@
+ #include "strata/core/conversation_cache.hpp"
+ #include "strata/core/conversation_file.hpp"
+ 
++#include <chrono>
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
+ #include <filesystem>
++#include <map>
++#include <mutex>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ namespace strata::core {
+@@ -27,6 +32,53 @@ namespace strata::core {
+ //   reject        never evicts: a spill that would not fit the budget is refused and reported, and nothing is removed.
+ enum class SpillWhenFull { evict_oldest, reject };
+ 
++// What --conversation-cache-spill-on selects. evict = the delta-1 behaviour: a conversation reaches disk only when
++// the RAM cache evicts it (the tier is overflow). park = the mirror: the conversation is also written the moment it
++// is parked at the end of a request, so an abrupt close loses at most the request in flight. Without a spill
++// directory both are inert: nothing is created and no byte is written.
++enum class SpillOn { evict, park };
++
++// The header of a conversation: the tokens through its first exchange (system prompt + first user turn, ending at
++// the first assistant turn). It is the fixed part of a chat: it does not change as turns are added, and a different
++// conversation has a different one. --turn-token < 0 (no turn token) yields 0, so nothing can be called a rewrite.
++inline size_t conversation_header_length(const std::vector<int32_t>& ids, int64_t turn_token) {
++    if (turn_token < 0 || ids.empty()) return 0;
++    int seen = 0;
++    for (size_t i = 0; i < ids.size(); ++i)
++        if (ids[i] == (int32_t) turn_token && ++seen == 3) return i;   // start of the first assistant turn
++    return ids.size();   // fewer than three turns: the whole thing is the header (nothing to call a tail rewrite)
++}
++
++// The writer's key for a conversation: a stable fingerprint of its header (or of its first tokens when there is no
++// turn token), unchanged as the conversation grows. Two conversations of one client share the system prompt but not
++// the header, so they are distinct cells.
++inline uint64_t conversation_key(const std::vector<int32_t>& ids, int64_t turn_token) {
++    if (ids.empty()) return 0;
++    size_t n = conversation_header_length(ids, turn_token);
++    // No turn token (or a chat shorter than three turns): a fixed prefix of the first tokens, still unchanged as the
++    // conversation grows, so a park of a growing chat stays one cell.
++    if (n == 0 || n >= ids.size()) n = ids.size() < 4096 ? ids.size() : 4096;
++    uint64_t h = 1469598103934665603ull;
++    for (size_t i = 0; i < n; ++i) { h ^= (uint64_t) (uint32_t) ids[i]; h *= 1099511628211ull; }
++    return h;
++}
++
++// R4: a request cancelled before it finished leaves a provisional session. Its live ids are reverted to the last
++// turn boundary the read actually reached, so the state describes exactly the closed conversation the client will
++// resend; the caller then suppresses the durable copy (the previous good one is left alone). Returns true when the
++// ids were reverted. `reached` is the exclusive end of what was read: the boundary is never taken past it.
++inline bool revert_to_turn_boundary(std::vector<int32_t>& ids, int64_t turn_token, size_t reached) {
++    if (turn_token < 0) return false;
++    const size_t limit = reached < ids.size() ? reached : ids.size();
++    for (size_t i = limit; i-- > 0;)
++        if (ids[i] == (int32_t) turn_token) {
++            if (i + 1 == ids.size()) return false;   // already ends on the boundary: nothing to revert
++            ids.resize(i + 1);
++            return true;
++        }
++    return false;
++}
++
+ struct ConversationSpillMatch {
+     std::string path;        // the session file to read back
+     uint64_t file_bytes = 0;
+@@ -50,18 +102,21 @@ public:
+     //                oldest first, counted in age_evictions(). This age lever is independent of `when_full`.
+     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
+               std::string& error, SpillWhenFull when_full = SpillWhenFull::evict_oldest, int64_t max_age_days = 0);
+-    bool enabled() const { return enabled_; }
+-    SpillWhenFull when_full() const { return when_full_; }
+-    int64_t max_age_days() const { return max_age_days_; }
+-    size_t size() const { return entries_.size(); }
+-    uint64_t bytes() const { return bytes_; }
++    // Locked: the park writer drains the same directory from its own thread.
++    bool enabled() const { std::lock_guard<std::mutex> lk(mu_); return enabled_; }
++    SpillWhenFull when_full() const { std::lock_guard<std::mutex> lk(mu_); return when_full_; }
++    int64_t max_age_days() const { std::lock_guard<std::mutex> lk(mu_); return max_age_days_; }
++    size_t size() const { std::lock_guard<std::mutex> lk(mu_); return entries_.size(); }
++    uint64_t bytes() const { std::lock_guard<std::mutex> lk(mu_); return bytes_; }
+     // What the last scan and the budget kept instead of wiping, by reason (reporting only; nothing is deleted here).
+-    size_t stale_files_kept() const { return stale_files_kept_; }        // unreadable/broken sidecar or a lost session file
+-    size_t foreign_files_kept() const { return foreign_files_kept_; }    // another model/config identity
+-    size_t orphan_files_kept() const { return orphan_files_kept_; }      // a session file with no sidecar
+-    size_t oversized_files_kept() const { return oversized_files_kept_; }// a conversation larger than the budget
+-    size_t disk_evictions() const { return disk_evictions_; }            // removed by the budget GC (oldest first)
+-    size_t age_evictions() const { return age_evictions_; }              // removed by --conversation-cache-spill-max-age-days
++    size_t stale_files_kept() const { std::lock_guard<std::mutex> lk(mu_); return stale_files_kept_; }        // unreadable/broken sidecar or a lost session file
++    size_t foreign_files_kept() const { std::lock_guard<std::mutex> lk(mu_); return foreign_files_kept_; }    // another model/config identity
++    size_t orphan_files_kept() const { std::lock_guard<std::mutex> lk(mu_); return orphan_files_kept_; }      // a session file with no sidecar
++    size_t oversized_files_kept() const { std::lock_guard<std::mutex> lk(mu_); return oversized_files_kept_; }// a conversation larger than the budget
++    size_t disk_evictions() const { std::lock_guard<std::mutex> lk(mu_); return disk_evictions_; }            // removed by the budget GC (oldest first)
++    size_t age_evictions() const { std::lock_guard<std::mutex> lk(mu_); return age_evictions_; }              // removed by --conversation-cache-spill-max-age-days
++    // R2: copies discarded because the client rewrote the conversation's tail (a compaction or an edited history).
++    size_t compacted() const { std::lock_guard<std::mutex> lk(mu_); return compacted_; }
+ 
+     // The best resume this directory offers for the prompt, from the sidecars only (no K/V read). similarity and
+     // n_min filter weak hits exactly as the RAM cache's best() does.
+@@ -69,6 +124,7 @@ public:
+     ConversationSpillMatch best(const std::vector<Token>& prompt,
+                                 const std::vector<ConversationImageKey>& images, bool cvec,
+                                 double similarity, int64_t n_min) const {
++        std::lock_guard<std::mutex> lk(mu_);
+         ConversationSpillMatch best_match;
+         int64_t best_tokens = 0;
+         for (size_t i = entries_.size(); i-- > 0;) {
+@@ -90,14 +146,30 @@ public:
+               const std::vector<SessionReadLimits>& limits, std::string& error) const;
+     // Writes a parked conversation (its K/V in RAM) as one session file per stage plus one joint sidecar, and indexes
+     // it. A conversation larger than the budget is written and indexed anyway; the GC decides about removal.
+-    bool spill(const SavedConversation& image, std::string& error);
++    // `stored_path`, when given, receives the session file just written (the park writer keeps it out of the
++    // supersede pass that follows, so the new copy is never the one removed).
++    bool spill(const SavedConversation& image, std::string& error, std::string* stored_path = nullptr);
+     bool erase(const std::string& path, std::string& error);
+     // A conversation being restored is held out of eviction until it is put back in RAM or dropped.
+     void pin(const std::string& path);
+     void unpin(const std::string& path);
+     // Removes the disk copies of this conversation a turn back, the same rule the RAM cache applies before evicting.
++    // `keep` (a session path) is never removed: the copy just written supersedes the older ones.
+     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
++                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
++                           const std::string& keep = std::string());
++    // R2: the client rewrote the conversation's tail (a compaction or an edited history), so the stored copy
++    // describes nothing it will send. A stored copy the prompt EXTENDS is the normal turn and is kept; a copy whose
++    // header does not match the prompt is another conversation and is left alone. A copy whose common prefix is
++    // shorter than `divergence_tokens` while its header still matches is discarded and counted in compacted().
++    // Returns how many were discarded. The prompt's token type is the caller's (the serve loop reads int64).
++    template<class Token>
++    size_t discard_diverged(const std::vector<Token>& prompt, bool cvec, size_t divergence_tokens, int64_t turn_token) {
++        std::vector<int32_t> ids;
++        ids.reserve(prompt.size());
++        for (const Token& token : prompt) ids.push_back((int32_t) token);   // token ids fit int32, the sidecar's width
++        return discard_diverged_impl(ids, cvec, divergence_tokens, turn_token);
++    }
+     // The stage file beside a conversation's first file: stage k (1-based) is "<stem>.stage<k>.sess".
+     static std::string stage_path(const std::string& session_path, size_t stage);
+ 
+@@ -115,6 +187,7 @@ private:
+         std::string meta_path() const { return stem.string() + ".meta"; }
+     };
+     const Entry* find(const std::string& path) const;
++    size_t discard_diverged_impl(const std::vector<int32_t>& prompt, bool cvec, size_t divergence_tokens, int64_t turn_token);
+     void enforce_budget();
+     void enforce_age();
+     bool remove_entry(size_t index);
+@@ -127,10 +200,178 @@ private:
+     SessionFileIdentity identity_{};
+     uint64_t budget_ = 0, bytes_ = 0, serial_ = 0;
+     size_t stale_files_kept_ = 0, foreign_files_kept_ = 0, orphan_files_kept_ = 0, oversized_files_kept_ = 0;
+-    size_t disk_evictions_ = 0, age_evictions_ = 0;
++    size_t disk_evictions_ = 0, age_evictions_ = 0, compacted_ = 0;
+     std::filesystem::path directory_;
+     std::vector<Entry> entries_;   // oldest spill first
+     std::string pinned_path_;
++    mutable std::mutex mu_;        // the park writer drains the same directory from its own thread
++};
++
++// The park writer (--conversation-cache-spill-on park). The disk tier stops being overflow and becomes a mirror:
++// the state parked at the end of a request is written to disk. One cell per conversation holds only the NEWEST
++// state to write; a background thread drains it. Parks that arrive while a write is in flight REPLACE the cell
++// (collapsed, counted) instead of queueing, so a turn with five tool calls writes once, not five times. Each
++// drained state is spilled and the copy it supersedes (the previous copy of the same conversation, and the copies
++// a supersede pass removes) is dropped AFTER the new one is on disk, so the folder holds one copy per conversation
++// and the previous good copy is only replaced once its successor exists.
++class ConversationSpillWriter {
++public:
++    ConversationSpillWriter() = default;
++    ~ConversationSpillWriter() { stop(); }
++    ConversationSpillWriter(const ConversationSpillWriter&) = delete;
++    ConversationSpillWriter& operator=(const ConversationSpillWriter&) = delete;
++
++    // `cache` must outlive the writer (otherwise stop() first). throttle_s: 0 = write on every post; N > 0 = do not
++    // rewrite the same conversation inside an N-second window (the park is postponed to a later one, counted).
++    void start(ConversationSpillCache* cache, int64_t throttle_s) {
++        std::lock_guard<std::mutex> lk(mu_);
++        cache_ = cache;
++        throttle_s_ = throttle_s < 0 ? 0 : throttle_s;
++        if (running_) return;
++        running_ = true;
++        quit_ = false;
++        worker_ = std::thread([this] { loop(); });
++    }
++    // Stops the thread (after draining what it holds) and writes anything left on the calling thread.
++    void stop() {
++        std::thread worker;
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            if (running_) {
++                quit_ = true;
++                running_ = false;
++                worker = std::move(worker_);
++            }
++        }
++        cv_.notify_all();
++        if (worker.joinable()) worker.join();
++        drain();
++    }
++    bool running() const { std::lock_guard<std::mutex> lk(mu_); return running_; }
++
++    // Cheap pre-check so the caller does not build the copy post() would only discard: would a state of this size
++    // for this key be written right now (grown past the last write, and outside the throttle window)?
++    bool wants(uint64_t key, size_t tokens) const {
++        std::lock_guard<std::mutex> lk(mu_);
++        auto last = last_written_.find(key);
++        if (last != last_written_.end() && tokens <= last->second) return false;
++        if (throttle_s_ > 0) {
++            auto throttled = throttle_at_.find(key);
++            if (throttled != throttle_at_.end() &&
++                std::chrono::steady_clock::now() - throttled->second < std::chrono::seconds(throttle_s_)) return false;
++        }
++        return true;
++    }
++
++    // Hands a conversation to the writer. A state whose live ids did not grow past the last one written for this
++    // key is skipped (nothing changed); a park inside the throttle window is postponed. Returns true when the state
++    // was queued (or replaced a queued one).
++    bool post(uint64_t key, SavedConversation&& image) {
++        std::lock_guard<std::mutex> lk(mu_);
++        if (image.live.ids.empty()) return false;
++        const size_t size = image.live.ids.size();
++        auto last = last_written_.find(key);
++        if (last != last_written_.end() && size <= last->second) { ++skipped_; return false; }
++        const auto now = std::chrono::steady_clock::now();
++        auto throttled = throttle_at_.find(key);
++        if (throttle_s_ > 0 && throttled != throttle_at_.end() &&
++            now - throttled->second < std::chrono::seconds(throttle_s_)) { ++throttled_; return false; }
++        Cell& cell = cells_[key];
++        if (cell.occupied) ++collapsed_;
++        cell.key = key;
++        cell.image = std::move(image);
++        cell.occupied = true;
++        cv_.notify_one();
++        return true;
++    }
++
++    // Writes every pending state, on the calling thread. Returns how many were written.
++    size_t drain() {
++        size_t written = 0;
++        for (;;) {
++            Cell cell;
++            {
++                std::lock_guard<std::mutex> lk(mu_);
++                if (!take_locked(cell)) break;
++            }
++            if (write_cell(cell)) ++written;
++        }
++        return written;
++    }
++
++    size_t writes() const { std::lock_guard<std::mutex> lk(mu_); return writes_; }        // states that reached disk
++    size_t collapsed() const { std::lock_guard<std::mutex> lk(mu_); return collapsed_; }  // parks a newer state replaced
++    size_t throttled() const { std::lock_guard<std::mutex> lk(mu_); return throttled_; }  // parks postponed by the throttle
++    size_t skipped() const { std::lock_guard<std::mutex> lk(mu_); return skipped_; }      // parks that changed nothing
++    size_t refused() const { std::lock_guard<std::mutex> lk(mu_); return refused_; }      // cache refused a write
++
++private:
++    struct Cell {
++        uint64_t key = 0;
++        SavedConversation image;
++        bool occupied = false;
++    };
++    // A cell leaves the writer's map while its write runs, so the NEXT park of the same conversation becomes a
++    // fresh cell (written after this one and superseding it). Anything posted while the write runs is a collapse
++    // candidate only once it is queued; the collapse counter counts replaced queued states.
++    bool take_locked(Cell& out) {
++        for (auto& kv : cells_) {
++            if (!kv.second.occupied) continue;
++            out = std::move(kv.second);
++            kv.second.occupied = false;
++            kv.second.image = SavedConversation{};
++            return true;
++        }
++        return false;
++    }
++    bool write_cell(Cell& cell) {
++        ConversationSpillCache* cache = cache_;
++        bool ok = false;
++        if (cache != nullptr && cache->enabled()) {
++            std::string path, error;
++            ok = cache->spill(cell.image, error, &path);
++            if (ok) cache->drop_superseded(cell.image.live.ids, cell.image.live.imgs, cell.image.checkpoints,
++                                           cell.image.cvec, path);
++        }
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            if (ok) {
++                ++writes_;
++                last_written_[cell.key] = cell.image.live.ids.size();
++                throttle_at_[cell.key] = std::chrono::steady_clock::now();
++            } else {
++                ++refused_;
++            }
++        }
++        return ok;
++    }
++    void loop() {
++        std::unique_lock<std::mutex> lk(mu_);
++        for (;;) {
++            cv_.wait(lk, [this] { return quit_ || any_pending_locked(); });
++            if (quit_) break;
++            Cell cell;
++            if (!take_locked(cell)) continue;
++            lk.unlock();
++            write_cell(cell);
++            lk.lock();
++        }
++    }
++    bool any_pending_locked() const {
++        for (const auto& kv : cells_) if (kv.second.occupied) return true;
++        return false;
++    }
++
++    mutable std::mutex mu_;
++    std::condition_variable cv_;
++    std::thread worker_;
++    ConversationSpillCache* cache_ = nullptr;
++    bool running_ = false, quit_ = false;
++    int64_t throttle_s_ = 0;
++    size_t writes_ = 0, collapsed_ = 0, throttled_ = 0, skipped_ = 0, refused_ = 0;
++    std::map<uint64_t, Cell> cells_;
++    std::map<uint64_t, size_t> last_written_;   // per key: the live ids of the last state written
++    std::map<uint64_t, std::chrono::steady_clock::time_point> throttle_at_;
+ };
+ 
+ } // namespace strata::core
+diff --git a/src/core/conversation_spill.cpp b/src/core/conversation_spill.cpp
+index 5d3149c..a2e52d5 100644
+--- a/src/core/conversation_spill.cpp
++++ b/src/core/conversation_spill.cpp
+@@ -188,6 +188,7 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
+ bool ConversationSpillCache::open(const std::filesystem::path& directory, SessionFileIdentity identity,
+                                   uint64_t budget_bytes, std::string& error, SpillWhenFull when_full,
+                                   int64_t max_age_days) {
++    std::lock_guard<std::mutex> lock(mu_);
+     enabled_ = false;
+     stale_files_kept_ = 0;
+     foreign_files_kept_ = 0;
+@@ -195,6 +196,7 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
+     oversized_files_kept_ = 0;
+     disk_evictions_ = 0;
+     age_evictions_ = 0;
++    compacted_ = 0;
+     entries_.clear();
+     bytes_ = 0;
+     pinned_path_.clear();
+@@ -279,6 +281,7 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
+ 
+ bool ConversationSpillCache::load(const std::string& path, SavedConversation& image,
+                                   const std::vector<SessionReadLimits>& limits, std::string& error) const {
++    std::lock_guard<std::mutex> lock(mu_);
+     if (!enabled_) { error = "spill cache is disabled"; return false; }
+     const Entry* entry = find(path);
+     const size_t stages = entry ? entry->stages : 0;
+@@ -304,7 +307,8 @@ bool ConversationSpillCache::load(const std::string& path, SavedConversation& im
+     return true;
+ }
+ 
+-bool ConversationSpillCache::spill(const SavedConversation& image, std::string& error) {
++bool ConversationSpillCache::spill(const SavedConversation& image, std::string& error, std::string* stored_path) {
++    std::lock_guard<std::mutex> lock(mu_);
+     if (!enabled_) return false;
+     if (image.live.ids.empty()) { error = "spill needs a conversation with tokens"; return false; }
+     // --conversation-cache-spill-when-full reject: a full directory refuses a new spill instead of evicting. The
+@@ -369,6 +373,7 @@ bool ConversationSpillCache::spill(const SavedConversation& image, std::string&
+     }
+     bytes_ += total;
+     enforce_budget();
++    if (stored_path != nullptr) *stored_path = session;
+     return true;
+ }
+ 
+@@ -392,6 +397,7 @@ bool ConversationSpillCache::remove_entry(size_t index) {
+ }
+ 
+ bool ConversationSpillCache::erase(const std::string& path, std::string& error) {
++    std::lock_guard<std::mutex> lock(mu_);
+     auto found = std::find_if(entries_.begin(), entries_.end(),
+                               [&](const Entry& entry) { return entry.session_path() == path; });
+     if (found == entries_.end()) return true;
+@@ -406,15 +412,21 @@ bool ConversationSpillCache::erase(const std::string& path, std::string& error)
+     return true;
+ }
+ 
+-void ConversationSpillCache::pin(const std::string& path) { pinned_path_ = path; }
++void ConversationSpillCache::pin(const std::string& path) {
++    std::lock_guard<std::mutex> lock(mu_);
++    pinned_path_ = path;
++}
+ 
+ void ConversationSpillCache::unpin(const std::string& path) {
++    std::lock_guard<std::mutex> lock(mu_);
+     if (pinned_path_ == path) { pinned_path_.clear(); enforce_budget(); }
+ }
+ 
+ size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
+                                                const std::vector<ConversationImageKey>& images,
+-                                               const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
++                                               const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
++                                               const std::string& keep) {
++    std::lock_guard<std::mutex> lock(mu_);
+     size_t dropped = 0;
+     for (size_t i = 0; i < entries_.size();) {
+         const Entry& entry = entries_[i];
+@@ -439,7 +451,8 @@ size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
+         bool held = same_saved_prefix(deepest, ids, images);
+         for (const auto& checkpoint : checkpoints)
+             if (!held && same_saved_prefix(deepest, checkpoint.ids, checkpoint.imgs)) held = true;
+-        if (entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_) {
++        if (entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_ &&
++            !(!keep.empty() && entry.session_path() == keep)) {
+             if (!remove_entry(i)) { ++i; continue; }   // a failed removal: leave this entry in the index
+             ++dropped;
+             continue;
+@@ -449,6 +462,30 @@ size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
+     return dropped;
+ }
+ 
++size_t ConversationSpillCache::discard_diverged_impl(const std::vector<int32_t>& prompt, bool cvec,
++                                                     size_t divergence_tokens, int64_t turn_token) {
++    std::lock_guard<std::mutex> lock(mu_);
++    if (!enabled_ || prompt.empty() || turn_token < 0) return 0;
++    size_t discarded = 0;
++    for (size_t i = 0; i < entries_.size();) {
++        const Entry& entry = entries_[i];
++        if (entry.cvec != cvec) { ++i; continue; }                    // another steering mode: another conversation
++        const std::vector<int32_t>& stored = entry.live_meta.ids;
++        const size_t n = stored.size() < prompt.size() ? stored.size() : prompt.size();
++        size_t common = 0;
++        while (common < n && stored[common] == prompt[common]) ++common;
++        if (common == stored.size()) { ++i; continue; }               // the prompt extends it: the normal turn
++        const size_t header = conversation_header_length(stored, turn_token);
++        if (header == 0 || common < header) { ++i; continue; }        // the headers differ: another conversation
++        if (common >= divergence_tokens) { ++i; continue; }           // a small edit, not a rewritten tail
++        if (entry.session_path() == pinned_path_) { ++i; continue; }
++        if (!remove_entry(i)) { ++i; continue; }                      // a failed removal: leave it in the index
++        ++discarded;
++        ++compacted_;
++    }
++    return discarded;
++}
++
+ void ConversationSpillCache::enforce_budget() {
+     // The GC's budget lever: oldest first, with a counter. A conversation larger than the whole budget is left
+     // alone - removing it could never bring `bytes_` under `budget_` - and counted as oversized instead. With
+diff --git a/src/core/conversation_spill_test.cpp b/src/core/conversation_spill_test.cpp
+index 9617cc7..5cacf47 100644
+--- a/src/core/conversation_spill_test.cpp
++++ b/src/core/conversation_spill_test.cpp
+@@ -61,6 +61,33 @@ SavedConversation sample(size_t tokens) {
+     }
+     return s;
+ }
++// A conversation whose live ids are exactly `ids` (the sidecar keeps only the checkpoint lengths, so their own ids
++// do not have to match - the divergence rule reads live ids alone). `cp` names the one checkpoint's length; 0 = half.
++SavedConversation conversation_with_ids(const std::vector<int32_t>& ids, size_t cp = 0) {
++    SavedConversation s = sample(ids.size());
++    s.live.ids = ids;
++    s.checkpoints.clear();
++    const size_t len = cp != 0 ? cp : ids.size() / 2;
++    ConversationCheckpoint c = checkpoint(len, 9);
++    c.ids.assign(ids.begin(), ids.begin() + (std::ptrdiff_t) len);
++    s.checkpoints.push_back(std::move(c));
++    return s;
++}
++// A conversation template: a header of twelve tokens (three turn markers, `seed` in it, so every seed is its own
++// conversation) followed by `n` tokens of tail. Two calls with the same seed share the header and are one chat.
++std::vector<int32_t> conv_ids(int32_t seed, size_t n) {
++    std::vector<int32_t> ids = {seed, seed + 1, seed + 2, 500, seed + 3, seed + 4, seed + 5, 500,
++                                seed + 6, seed + 7, seed + 8, 500};
++    for (size_t i = 0; i < n; ++i) ids.push_back((int32_t) (seed + 100 + (int32_t) i));
++    return ids;
++}
++std::vector<uint8_t> read_file_bytes(const fs::path& path) {
++    std::vector<uint8_t> bytes;
++    std::ifstream in(path, std::ios::binary);
++    if (!in) return bytes;
++    bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++    return bytes;
++}
+ bool buffers_equal(const ConversationBuffer& a, const ConversationBuffer& b) {
+     if (a.size() != b.size()) return false;
+     bool same = true;
+@@ -311,6 +338,221 @@ int main() {
+     check(aged.age_evictions() >= 1, "old conversations pruned by age");
+     check(aged.size() == 0, "every conversation older than the limit went");
+ 
++    // ---- Delta 2 / R3: the park writer writes a conversation with no eviction, collapses, throttles ----
++    fs::remove_all(dir);
++    {
++        ConversationSpillCache park;
++        check(park.open(dir, id, 1ull << 30, error), "park: open the spill directory");
++        ConversationSpillWriter writer;
++        writer.start(&park, 0);
++        writer.stop();   // thread joined: post() + drain() below run deterministically on this thread
++        SavedConversation p1 = conversation_with_ids(conv_ids(1000, 800));
++        const uint64_t key = conversation_key(conv_ids(1000, 800), 248045);
++        check(writer.post(key, std::move(p1)), "park: post the conversation");
++        check(writer.writes() == 0, "park: nothing written before the drain");
++        check(writer.drain() == 1, "park: drain writes once");
++        check(writer.writes() == 1 && writer.refused() == 0, "park: one write, none refused");
++        // The file is on disk although nothing was evicted from any RAM cache: the acceptance criterion.
++        check(park.size() == 1, "park: one conversation on disk without an eviction");
++        check(park.disk_evictions() == 0, "park: no eviction happened");
++        std::vector<int32_t> cont = conv_ids(1000, 800);
++        cont.push_back(int32_t(7777));
++        const auto park_hit = park.best(cont, {}, false, 0.0, 0);
++        check(bool(park_hit) && park_hit.tokens == (int64_t) cont.size() - 1, "park: the written copy matches");
++
++        // R3 collapse: two parks of one conversation before the drain write once, replacing the queued state.
++        SavedConversation q1 = conversation_with_ids(conv_ids(2000, 800));
++        SavedConversation q2 = conversation_with_ids(conv_ids(2000, 1200));   // same chat, one turn longer
++        const uint64_t qkey = conversation_key(conv_ids(2000, 800), 248045);
++        check(writer.post(qkey, std::move(q1)), "park: post a growing conversation");
++        check(writer.post(qkey, std::move(q2)), "park: post its next state (replaces the queued one)");
++        check(writer.collapsed() == 1, "park: the replaced state is counted as collapsed");
++        const size_t before_q = park.size();
++        check(writer.drain() == 1, "park: the drain writes only the newest state");
++        check(writer.writes() == 2, "park: the second conversation added exactly one write");
++        check(park.size() == before_q + 1, "park: one copy for the conversation, not two");
++
++        // Two parks of the SAME conversation where the second supersedes the first on disk: one copy, new content.
++        SavedConversation r1 = conversation_with_ids(conv_ids(3000, 800), 500);
++        SavedConversation r2 = conversation_with_ids(conv_ids(3000, 1100), 500);
++        const uint64_t rkey = conversation_key(conv_ids(3000, 800), 248045);
++        const size_t before_r = park.size();
++        check(writer.post(rkey, std::move(r1)), "park: post state A");
++        check(writer.drain() == 1, "park: write A");
++        check(writer.post(rkey, std::move(r2)), "park: post the longer state B");
++        check(writer.drain() == 1, "park: write B supersedes A");
++        check(park.size() == before_r + 1, "park: one copy after the replacement");
++        std::vector<int32_t> rc = conv_ids(3000, 1100);
++        rc.push_back(int32_t(8888));
++        const auto rematch = park.best(rc, {}, false, 0.0, 0);
++        check(bool(rematch) && rematch.tokens == (int64_t) rc.size() - 1, "park: the replacement holds the newer state");
++
++        // The skip lever: a state that did not grow past what was written for that key is not posted again.
++        SavedConversation s1 = conversation_with_ids(conv_ids(4000, 500));
++        const uint64_t skey = conversation_key(conv_ids(4000, 500), 248045);
++        check(writer.post(skey, std::move(s1)), "park: post a state");
++        check(writer.drain() == 1, "park: write it");
++        SavedConversation s2 = conversation_with_ids(conv_ids(4000, 500));   // same size: nothing changed
++        check(!writer.post(skey, std::move(s2)), "park: an unchanged state is skipped");
++        check(writer.skipped() == 1, "park: the skip is counted");
++    }
++
++    // ---- Delta 2 / R3: park + reject keeps the older copy and counts the refusal ----
++    fs::remove_all(dir);
++    {
++        ConversationSpillCache seedp;
++        check(seedp.open(dir, id, 1ull << 30, error), "park/reject: open");
++        SavedConversation w1 = conversation_with_ids(conv_ids(5000, 800));
++        check(seedp.spill(w1, error), "park/reject: seed one conversation");
++        const uint64_t one_file = seedp.bytes();
++        std::string keep;
++        for (const auto& e : fs::directory_iterator(dir))
++            if (e.path().extension() == ".sess") keep = e.path().string();
++        const std::vector<uint8_t> keep_bytes = read_file_bytes(keep);
++        check(!keep_bytes.empty(), "park/reject: the stored copy has bytes");
++
++        ConversationSpillCache reject;
++        check(reject.open(dir, id, one_file, error, SpillWhenFull::reject, 0), "park/reject: open with reject");
++        ConversationSpillWriter writer;
++        writer.start(&reject, 0);
++        writer.stop();
++        SavedConversation w2 = conversation_with_ids(conv_ids(6000, 800));   // another conversation
++        const uint64_t wkey = conversation_key(conv_ids(6000, 800), 248045);
++        check(writer.post(wkey, std::move(w2)), "park/reject: post the conversation");
++        check(writer.drain() == 0, "park/reject: the drain writes nothing");
++        check(writer.refused() == 1, "park/reject: the refusal is counted");
++        check(reject.disk_evictions() == 0 && reject.size() == 1, "park/reject: nothing was evicted");
++        check(read_file_bytes(keep) == keep_bytes, "park/reject: the older copy is byte-for-byte intact");
++    }
++
++    // ---- Delta 2 / R3: the throttle postpones a rewrite inside its window ----
++    fs::remove_all(dir);
++    {
++        ConversationSpillCache park;
++        check(park.open(dir, id, 1ull << 30, error), "throttle: open");
++        ConversationSpillWriter writer;
++        writer.start(&park, 60);   // a 60 s window
++        writer.stop();             // join the worker; post()/drain() stay deterministic below
++        SavedConversation t1 = conversation_with_ids(conv_ids(7000, 500));
++        const uint64_t tkey = conversation_key(conv_ids(7000, 500), 248045);
++        check(writer.post(tkey, std::move(t1)), "throttle: the first state is queued");
++        check(writer.drain() == 1, "throttle: written");
++        SavedConversation t2 = conversation_with_ids(conv_ids(7000, 700));   // grew
++        check(!writer.post(tkey, std::move(t2)), "throttle: the rewrite inside the window is postponed");
++        check(writer.throttled() == 1, "throttle: the postponement is counted");
++        check(writer.writes() == 1, "throttle: still one write");
++    }
++    // Same, with the throttle off (0): the rewrite goes through.
++    fs::remove_all(dir);
++    {
++        ConversationSpillCache park;
++        check(park.open(dir, id, 1ull << 30, error), "throttle0: open");
++        ConversationSpillWriter writer;
++        writer.start(&park, 0);
++        writer.stop();
++        SavedConversation t1 = conversation_with_ids(conv_ids(8000, 500));
++        const uint64_t tkey = conversation_key(conv_ids(8000, 500), 248045);
++        check(writer.post(tkey, std::move(t1)), "throttle0: post");
++        check(writer.drain() == 1, "throttle0: write");
++        SavedConversation t2 = conversation_with_ids(conv_ids(8000, 700));
++        check(writer.post(tkey, std::move(t2)), "throttle0: the rewrite is not postponed");
++        check(writer.drain() == 1, "throttle0: rewritten");
++    }
++
++    // ---- Delta 2 / R2: a compacted conversation's copy is discarded; another conversation's is not ----
++    fs::remove_all(dir);
++    {
++        const int64_t turn = 500;
++        std::vector<int32_t> ids;
++        for (int32_t i = 1; i <= 10; ++i) ids.push_back(i);
++        ids.push_back((int32_t) turn);                       // 1st turn: start of the system message
++        for (int32_t i = 100; i < 120; ++i) ids.push_back(i);
++        ids.push_back((int32_t) turn);                       // 2nd turn: end of the system prompt
++        for (int32_t i = 200; i < 220; ++i) ids.push_back(i);
++        ids.push_back((int32_t) turn);                       // 3rd turn: end of the first user turn
++        const size_t header = conversation_header_length(ids, turn);
++        check(header == 52, "R2: the header ends at the first assistant turn");
++        for (int32_t i = 300; i < 5300; ++i) ids.push_back(i);   // a long tail
++
++        ConversationSpillCache c;
++        check(c.open(dir, id, 1ull << 30, error), "R2: open");
++        SavedConversation stored = conversation_with_ids(ids);
++        check(c.spill(stored, error), "R2: store the long conversation");
++        std::string stored_path;
++        for (const auto& e : fs::directory_iterator(dir))
++            if (e.path().extension() == ".sess") stored_path = e.path().string();
++        const std::vector<uint8_t> stored_bytes = read_file_bytes(stored_path);
++
++        // an extension (the normal next turn) is kept
++        std::vector<int32_t> extension = ids;
++        extension.push_back(int32_t(99999));
++        check(c.discard_diverged(extension, false, 4096, turn) == 0, "R2: an extension discards nothing");
++        check(c.size() == 1, "R2: the extension kept the copy");
++
++        // another conversation: the divergence is inside the header, so nothing is touched
++        std::vector<int32_t> other = ids;
++        other[40] = 123456;                                  // different first user turn
++        const std::vector<uint8_t> before_other = read_file_bytes(stored_path);
++        check(c.discard_diverged(other, false, 4096, turn) == 0, "R2: another conversation discards nothing");
++        check(c.size() == 1 && read_file_bytes(stored_path) == before_other, "R2: the other conversation's copy is untouched");
++
++        // a compaction: same header, rewritten short tail
++        std::vector<int32_t> compacted(ids.begin(), ids.begin() + (std::ptrdiff_t) header + 100);
++        for (int32_t i = 0; i < 100; ++i) compacted[(size_t) header + (size_t) i] = int32_t(70000 + i);
++        check(c.discard_diverged(compacted, false, 4096, turn) == 1, "R2: the compacted copy is discarded");
++        check(c.compacted() == 1, "R2: the compaction is counted");
++        check(c.size() == 0, "R2: the discarded copy left the index");
++        check(!fs::exists(stored_path), "R2: its file is gone, not left orphaned");
++        (void) stored_bytes;
++
++        // after the discard, the next park writes the compacted history (the conversation is new again)
++        check(c.spill(conversation_with_ids(compacted), error), "R2: the compacted conversation is repar ked");
++        check(c.size() == 1, "R2: one copy again");
++    }
++
++    // ---- Delta 2 / R4: a cancelled request is provisional; the previous copy is untouched ----
++    fs::remove_all(dir);
++    {
++        const int64_t turn = 500;
++        ConversationSpillCache c;
++        check(c.open(dir, id, 1ull << 30, error), "R4: open");
++        std::vector<int32_t> closed = {1, 2, turn, 3, 4, turn, 5, 6, turn, 7, 8, 9};   // the closed conversation
++        const size_t closed_len = closed.size();
++        check(c.spill(conversation_with_ids(closed), error), "R4: the closed conversation is on disk");
++        std::string path;
++        for (const auto& e : fs::directory_iterator(dir))
++            if (e.path().extension() == ".sess") path = e.path().string();
++        const std::vector<uint8_t> good = read_file_bytes(path);
++        check(!good.empty(), "R4: the good copy has bytes");
++
++        // The cancelled request: the prompt grew with a new assistant turn whose answer was cut short.
++        std::vector<int32_t> consumed = closed;
++        consumed.push_back((int32_t) turn);          // <|im_start|>assistant
++        for (int32_t i = 0; i < 40; ++i) consumed.push_back(int32_t(9000 + i));   // the partial answer
++        const size_t reached = consumed.size();
++        check(revert_to_turn_boundary(consumed, turn, reached), "R4: the live ids are reverted");
++        check(consumed.size() == closed_len + 1, "R4: the partial answer is dropped");
++        check(consumed.back() == (int32_t) turn, "R4: the live state ends on the last turn token");
++        // the boundary is never taken past what the read reached
++        std::vector<int32_t> no_turns = {1, 2, 3, 4, 5};
++        std::vector<int32_t> short_read = no_turns;
++        short_read.push_back((int32_t) turn);
++        short_read.push_back(int32_t(4242));
++        check(!revert_to_turn_boundary(short_read, turn, no_turns.size()), "R4: a boundary past the read is refused");
++
++        // Provisional: no post is made (the engine sets park_provisional and skips the writer), so the disk copy
++        // is byte-for-byte the same one.
++        check(read_file_bytes(path) == good, "R4: the previous copy is intact after the cancel");
++        check(c.size() == 1, "R4: no new copy was published");
++
++        // The retry succeeds: the stored (closed) copy is the prefix the reverted state starts with.
++        std::vector<int32_t> retry = consumed;
++        retry.push_back(int32_t(919191));            // the client's retried answer
++        const auto retry_hit = c.best(retry, {}, false, 0.0, 0);
++        check(bool(retry_hit) && retry_hit.tokens == (int64_t) closed_len,
++              "R4: the retry resumes from the closed conversation");
++    }
++
+     fs::remove_all(dir);
+     std::printf("conversation_spill_test: %d checks passed\n", checks);
+     return 0;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 8c3902e..34d5458 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -603,6 +603,17 @@ struct Options {
+     /// --conversation-cache-spill-max-age-days: optional age pruning of the spill directory (0 = off, no deletion
+     /// by time at all; positive = the GC drops conversations older than that, oldest first).
+     int64_t conversation_cache_spill_max_age_days = 0;
++    /// --conversation-cache-spill-on: what turns the disk tier from overflow into a mirror. "park" (the default
++    /// when the tier is on) also writes a conversation the moment it is parked at the end of a request, so a close
++    /// loses at most the request in flight. "evict" is the delta-1 behaviour: only what the RAM cache evicts is
++    /// written. Without --conversation-cache-spill-dir both are inert.
++    std::string conversation_cache_spill_on = "park";
++    /// --conversation-cache-spill-divergence-tokens: the common-prefix length below which a stored copy whose header
++    /// took part in it is read as a rewritten tail (a compaction or an edited history) and is discarded, not kept.
++    int64_t conversation_cache_spill_divergence_tokens = 4096;
++    /// --conversation-cache-spill-park-throttle-s: 0 = write on every park; N > 0 = do not rewrite the same
++    /// conversation inside N seconds (the park is postponed to a later one).
++    int64_t conversation_cache_spill_park_throttle_s = 0;
+     /// --system-prompt-cache (F5, opt-in): persist the checkpoint root that ends the system prompt (the one
+     /// --prompt-cache-root builds in RAM) as an ordinary session file, and reload it at start so a NEW chat reads
+     /// only the tokens after it. Off by default: no directory is created and no byte is written.
+@@ -762,6 +773,15 @@ void usage() {
+                  "                       removes nothing\n"
+                  "  --conversation-cache-spill-max-age-days N  --serve: prune spill conversations older than N days,\n"
+                  "                       oldest first (default 0 = off; no deletion by time at all)\n"
++                 "  --conversation-cache-spill-on MODE  --serve: park (default when the disk tier is on) also writes\n"
++                 "                       a conversation the moment it is parked at the end of a request, so a close\n"
++                 "                       loses at most the request in flight; evict is the delta-1 behaviour (only what\n"
++                 "                       the RAM cache evicts reaches disk). Inert without --conversation-cache-spill-dir\n"
++                 "  --conversation-cache-spill-divergence-tokens N  --serve: a stored copy whose common prefix with the\n"
++                 "                       incoming prompt is shorter than N tokens, with its header intact, is a rewritten\n"
++                 "                       tail (a compaction): it is discarded, not kept (default 4096)\n"
++                 "  --conversation-cache-spill-park-throttle-s N  --serve, park mode: do not rewrite the same\n"
++                 "                       conversation inside an N-second window (default 0 = write on every park)\n"
+                  "  --system-prompt-cache  --serve: persist the system-prompt checkpoint root (--prompt-cache-root) to\n"
+                  "                       disk and reload it at start, so a new chat of the same client reads only the\n"
+                  "                       tokens after it (default off; needs --system-prompt-cache-dir)\n"
+@@ -1800,6 +1820,25 @@ int main(int argc, char** argv) {
+             }
+             o.conversation_cache_spill_max_age_days = number;
+         }
++        else if (a == "--conversation-cache-spill-on") {
++            const std::string value = next("--conversation-cache-spill-on");
++            if (value != "evict" && value != "park") {
++                std::fprintf(stderr, "--conversation-cache-spill-on takes evict or park\n");
++                return 2;
++            }
++            o.conversation_cache_spill_on = value;
++        }
++        else if (a == "--conversation-cache-spill-divergence-tokens" || a == "--conversation-cache-spill-park-throttle-s") {
++            const std::string value = next(a.c_str());
++            int64_t number = 0;
++            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
++            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0) {
++                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
++                return 2;
++            }
++            if (a == "--conversation-cache-spill-divergence-tokens") o.conversation_cache_spill_divergence_tokens = number;
++            else o.conversation_cache_spill_park_throttle_s = number;
++        }
+         else if (a == "--system-prompt-cache") o.system_prompt_cache = true;
+         else if (a == "--system-prompt-cache-dir") o.system_prompt_cache_dir = next("--system-prompt-cache-dir");
+         else if (a == "--system-prompt-cache-key") o.system_prompt_cache_key = next("--system-prompt-cache-key");
+@@ -6404,6 +6443,9 @@ int main(int argc, char** argv) {
+         std::vector<int32_t> live;
+         std::vector<ImgKey> live_imgs, req_imgs;
+         bool live_ok = false;
++        // R4: the live session is provisional after a cancelled request: it is reverted to the last turn boundary and
++        // the next park must not publish a durable copy of it (the previous good copy is left alone).
++        bool park_provisional = false;
+         std::vector<ConvCheckpoint> checks;
+         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
+         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+@@ -6510,17 +6552,27 @@ int main(int argc, char** argv) {
+                     std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", spill_error.c_str());
+                 } else if (conversation_spill.enabled()) {
+                     std::fprintf(stderr, "strata serve: conversation cache: spill dir ready (%zu conversations, %llu MiB, "
+-                                 "when-full=%s, max-age=%lld d, %zu oversized kept, %zu stale kept, %zu foreign kept, "
+-                                 "%zu orphans kept, %zu disk evictions, %zu age evictions)\n",
++                                 "when-full=%s, max-age=%lld d, spill-on=%s, divergence=%lld tok, park-throttle=%lld s, "
++                                 "%zu oversized kept, %zu stale kept, %zu foreign kept, %zu orphans kept, "
++                                 "%zu disk evictions, %zu age evictions)\n",
+                                  conversation_spill.size(), (unsigned long long) (conversation_spill.bytes() >> 20),
+                                  o.conversation_cache_spill_when_full.c_str(),
+                                  (long long) o.conversation_cache_spill_max_age_days,
++                                 o.conversation_cache_spill_on.c_str(),
++                                 (long long) o.conversation_cache_spill_divergence_tokens,
++                                 (long long) o.conversation_cache_spill_park_throttle_s,
+                                  conversation_spill.oversized_files_kept(), conversation_spill.stale_files_kept(),
+                                  conversation_spill.foreign_files_kept(), conversation_spill.orphan_files_kept(),
+                                  conversation_spill.disk_evictions(), conversation_spill.age_evictions());
+                 }
+             }
+         }
++        // Delta 2 / R3: with --conversation-cache-spill-on park the tier is a mirror, not overflow. The park writer
++        // holds one cell per conversation (only the newest state) and a background thread drains it, so a turn with
++        // five tool calls writes once. It is inert without a spill directory.
++        const bool spill_on_park = conversation_spill.enabled() && o.conversation_cache_spill_on == "park";
++        strata::core::ConversationSpillWriter park_writer;
++        if (spill_on_park) park_writer.start(&conversation_spill, o.conversation_cache_spill_park_throttle_s);
+         // The system-prompt prefill cache (F5): the checkpoint root that ends the system prompt (--prompt-cache-root)
+         // persisted as ordinary session files and reloaded at start, so a NEW chat of the same client reads only
+         // the tokens after it.  Its own directory, its own budget, its own variant count.  Off unless
+@@ -6556,7 +6608,13 @@ int main(int argc, char** argv) {
+             if (!conversation_spill.enabled()) return;
+             try {
+                 std::string spill_error;
+-                if (conversation_spill.spill(evicted, spill_error)) {
++                std::string stored;
++                if (conversation_spill.spill(evicted, spill_error, &stored)) {
++                    // park mode: an eviction confirms what the mirror already wrote, so the older copy of this
++                    // conversation goes once the new one is on disk (one copy per conversation, never two).
++                    if (spill_on_park)
++                        conversation_spill.drop_superseded(evicted.live.ids, evicted.live.imgs, evicted.checkpoints,
++                                                           evicted.cvec, stored);
+                     std::fprintf(stderr, "strata serve: conversation cache: spilled %zu tokens (%zu MiB); disk=%zu MiB "
+                                  "disk_evictions=%zu\n", evicted.live.ids.size(), evicted.bytes() >> 20,
+                                  (size_t) (conversation_spill.bytes() >> 20), conversation_spill.disk_evictions());
+@@ -6572,15 +6630,26 @@ int main(int argc, char** argv) {
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current_body = [&](size_t held) -> bool {
+             if (!conversations.enabled() || !live_ok || live.empty()) return true;
++            // R4: a cancelled request left a provisional session. It is parked in RAM (the reuse is valid) but no
++            // durable copy is published of it, and the previous good copy is not touched: it is the prefix the
++            // client will resend on the retry.
++            const bool provisional = spill_on_park && park_provisional;
++            park_provisional = false;
++            if (provisional)
++                std::fprintf(stderr, "strata serve: conversation cache: provisional park (cancelled request); no disk copy\n");
+             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
+             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
+             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
+                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+-            const size_t disk_dropped = conversation_spill.drop_superseded(live, live_imgs, checks, cvec_cached);
+-            if (disk_dropped)
+-                std::fprintf(stderr, "strata serve: conversation cache: removed %zu superseded disk conversation%s\n",
+-                             disk_dropped, disk_dropped == 1 ? "" : "s");
++            // park mode: the writer supersedes the previous disk copy once the new one is on disk (one copy per
++            // conversation, and no window with none); evict mode keeps the delta-1 synchronous supersede.
++            if (!spill_on_park) {
++                const size_t disk_dropped = conversation_spill.drop_superseded(live, live_imgs, checks, cvec_cached);
++                if (disk_dropped)
++                    std::fprintf(stderr, "strata serve: conversation cache: removed %zu superseded disk conversation%s\n",
++                                 disk_dropped, disk_dropped == 1 ? "" : "s");
++            }
+             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
+             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
+             // stage parts for the capture and put back together whichever way this ends (no running state copied).
+@@ -6682,6 +6751,21 @@ int main(int argc, char** argv) {
+                     return true;
+                 }
+                 const size_t snapshot_bytes = image.bytes();
++                // R3: mirror the parked state to disk (asynchronous, collapsed). The writer takes a copy - put()
++                // below takes the original, and the writer's cell must not alias the RAM cache's entry. wants()
++                // keeps the copy from being built when the writer would only discard it.
++                if (spill_on_park && !provisional) {
++                    const uint64_t key = strata::core::conversation_key(live, o.turn_token);
++                    if (park_writer.wants(key, live.size())) {
++                        const auto tc = Clock::now();
++                        strata::core::SavedConversation mirrored = image;
++                        const double copy_ms = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
++                        park_writer.post(key, std::move(mirrored));
++                        std::fprintf(stderr, "strata serve: conversation cache: park mirror queued (%zu tokens, copy %.1f ms); "
++                                     "writes=%zu collapsed=%zu throttled=%zu\n", live.size(), copy_ms,
++                                     park_writer.writes(), park_writer.collapsed(), park_writer.throttled());
++                    }
++                }
+                 const bool stored = conversations.put(std::move(image), held);
+                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                              stored ? "parked" : "skipped", live.size(),
+@@ -8507,6 +8591,18 @@ int main(int argc, char** argv) {
+             std::optional<strata::core::SavedConversation> incoming;
+             bool incoming_from_disk = false;
+             std::string incoming_disk_path;
++            // R2: if the client rewrote this conversation's tail (a compaction or an edited history), the stored
++            // copy describes nothing it will send. Detect it from the sidecar's own token ids (no K/V read) and
++            // discard the copy - it can never be a hit and only occupies GB. A copy the prompt extends, or one
++            // whose header is another conversation's, is left alone.
++            if (spill_on_park) {   // a delta-2 refinement: --conversation-cache-spill-on evict reproduces delta 1
++                const size_t discarded = conversation_spill.discard_diverged(
++                        ids, want_cvec, (size_t) o.conversation_cache_spill_divergence_tokens, o.turn_token);
++                if (discarded)
++                    std::fprintf(stderr, "strata serve: conversation cache: discarded %zu compacted disk conversation%s "
++                                 "(the client rewrote the tail); compacted=%zu\n", discarded,
++                                 discarded == 1 ? "" : "s", conversation_spill.compacted());
++            }
+             // A spilled conversation can beat the RAM cache: match it from its sidecar (no K/V read), and only if it
+             // offers a longer resume than RAM, the batch slots and the live state does, read it back whole.
+             const auto disk_match = conversation_spill.best(ids, req_imgs, want_cvec,
+@@ -10293,6 +10389,24 @@ int main(int argc, char** argv) {
+                 live.swap(consumed);
+                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
+                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
++                park_provisional = false;   // a finished request leaves a settled state
++            } else if (spill_on_park) {
++                // R4: the request was cancelled (the engine's own "(cancelled)" line). The partial answer is
++                // provisional: revert the live ids to the last turn boundary the read actually reached, so the
++                // session describes exactly the closed conversation the client will resend, and mark the next park
++                // provisional so no durable copy is published of it (the previous good copy is left alone). The
++                // K/V past the boundary belongs to the discarded answer and is re-read on the retry.
++                const size_t reached = (size_t) std::max<int64_t>(0, std::min<int64_t>(pp_reached, (int64_t) consumed.size()));
++                std::vector<int32_t> reverted = consumed;
++                if (strata::core::revert_to_turn_boundary(reverted, o.turn_token, reached)) {
++                    live.swap(reverted);
++                    live_imgs = imgs_below(req_imgs, (int64_t) live.size());
++                    std::fprintf(stderr, "strata serve: conversation cache: cancelled request reverted to the last turn "
++                                 "boundary (%zu of %zu tokens); the disk copy is not republished\n",
++                                 live.size(), consumed.size());
++                }
++                live_ok = o.prompt_cache > 0 && req_ckpt;
++                park_provisional = live_ok;   // only a parkable state can leak a durable copy
+             }
+             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
+             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
+@@ -10576,10 +10690,17 @@ int main(int argc, char** argv) {
+             if (!park_current(0))
+                 std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",
+                              err.c_str());
++            // R3: drain the park writer before the RAM cache is emptied, so the mirror's own writes are on disk and
++            // the shutdown spill supersedes them instead of racing them.
++            if (spill_on_park) park_writer.stop();
+             const size_t resident = conversations.spill_all(spill_evicted);
+             std::fprintf(stderr, "strata serve: conversation cache: shutdown spilled %zu parked conversations; disk=%zu MiB "
+                          "disk_evictions=%zu\n", resident, (size_t) (conversation_spill.bytes() >> 20),
+                          conversation_spill.disk_evictions());
++            if (spill_on_park)
++                std::fprintf(stderr, "strata serve: conversation cache: park mirror: %zu writes, %zu collapsed, %zu skipped, "
++                             "%zu throttled, %zu refused\n", park_writer.writes(), park_writer.collapsed(),
++                             park_writer.skipped(), park_writer.throttled(), park_writer.refused());
+         }
+         if (system_prompt_cache.enabled())   // F5: the system prompt cache's own accounting, at shutdown
+             std::fprintf(stderr, "strata serve: system prompt cache: shutdown: %zu variants, %llu MiB, hits=%llu misses=%llu, "
+-- 
+2.53.0.windows.2
+

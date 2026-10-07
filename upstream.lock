@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "layer": "strata-agnostic-layer",
+  "layer_version": "0.2.0",
+  "descripcion": "Capa aditiva sobre Strata: tier de disco para slots/conversaciones en desuso (con layer-split) y caché de prefill del system prompt. Inerte sin flags.",
+  "base": {
+    "upstream": "https://github.com/Niko1221/Strata",
+    "tag": "v0.1.40.1",
+    "commit": "82f46a8c8f475f001ad76d92f58f4a4f8ffb0253",
+    "rama_de_trabajo": "layer/delta1",
+    "rama_base": "layer/base",
+    "rama_serie": "layer/series",
+    "nota_ramas": "layer/series es la cadena que se entrega: solo los commits que tocan el arbol de upstream, y de ahi sale patches/ (git format-patch v0.1.40.1..layer/series).  layer/delta1 la contiene mas el tooling de la capa (upstream.lock, verify-layer.ps1, apply-layer.ps1, patches/, la nota de entrega), que NO va en la serie.",
+    "nota": "La capa se construye ENCIMA de v0.1.40.1. Con los flags ausentes el comportamiento debe ser identico a esa version."
+  },
+  "absorbido_por_terceros": [
+    { "pr": 1271, "autor": "ANBAL534", "titulo": "conversation-cache-spill-dir", "url": "https://github.com/Niko1221/Strata/pull/1271", "aplicado_en": "layer/base" },
+    { "pr": 1269, "autor": "pspranger-throw", "titulo": "restore a session file sin sostener el K/V en RAM", "url": "https://github.com/Niko1221/Strata/pull/1269", "aplicado_en": "layer/base" }
+  ],
+  "flags": {
+    "tier_de_disco": [
+      "--conversation-cache-spill-dir",
+      "--conversation-cache-disk-mib",
+      "--conversation-cache-spill-when-full",
+      "--conversation-cache-spill-max-age-days",
+      "--conversation-cache-spill-on",
+      "--conversation-cache-spill-divergence-tokens",
+      "--conversation-cache-spill-park-throttle-s",
+      "--conversation-cache-similarity",
+      "--conversation-cache-n-min"
+    ],
+    "system_prompt": [
+      "--system-prompt-cache",
+      "--system-prompt-cache-dir",
+      "--system-prompt-cache-mib",
+      "--system-prompt-cache-slots",
+      "--system-prompt-cache-max-age-days",
+      "--system-prompt-cache-key"
+    ]
+  },
+  "anclas": [
+    { "id": "A1", "archivo": "include/strata/core/conversation_cache.hpp", "patron": "make_room", "que_protege": "punto de eviccion: el spill se engancha aqui" },
+    { "id": "A2", "archivo": "include/strata/core/conversation_cache.hpp", "patron": "spill", "que_protege": "callback de spill y spill_all" },
+    { "id": "A3", "archivo": "include/strata/core/conversation_cache.hpp", "patron": "conversation_checkpoints_split", "que_protege": "split/merge por etapa (layer-split)" },
+    { "id": "A4", "archivo": "src/core/conversation_file_test.cpp", "patron": "STRSESS", "que_protege": "formato en disco: un solo formato, identidad modelo/config" },
+    { "id": "A5", "archivo": "src/core/conversation_spill.cpp", "patron": "enforce_budget", "que_protege": "GC: unico lugar donde se borra" },
+    { "id": "A6", "archivo": "src/program/generate.cpp", "patron": "unknown argument", "que_protege": "un flag desconocido es error fatal: por eso los flags nuevos no pueden ir en un config de 0.1.39" },
+    { "id": "A7", "archivo": "src/program/generate.cpp", "patron": "--conversation-cache-spill-dir", "que_protege": "parser de args: los flags del tier existen" },
+    { "id": "A8", "archivo": "src/program/generate.cpp", "patron": "--system-prompt-cache", "que_protege": "parser de args: los flags del system prompt existen" },
+    { "id": "A9", "archivo": "CMakeLists.txt", "patron": "conversation_spill_test", "que_protege": "los tests del tier estan registrados en el build" },
+    { "id": "A10", "archivo": "src/program/generate.cpp", "patron": "--conversation-cache-spill-on", "que_protege": "parser de args: el modo del tier (park por defecto cuando el tier esta encendido)" },
+    { "id": "A11", "archivo": "include/strata/core/conversation_spill.hpp", "patron": "ConversationSpillWriter", "que_protege": "el escritor del park (colapso por conversacion, espejo en tiempo real)" }
+  ],
+  "invariantes": [
+    "Con los flags ausentes: paridad de tokens con upstream (inerte).",
+    "El escaneo del directorio de spill NO borra nada: conserva y cuenta (oversized, stale, identidad ajena, huerfanos).",
+    "Solo el GC borra, por presupuesto y edad, mas viejos primero, con contador.",
+    "Un archivo de identidad ajena se ignora, nunca se borra.",
+    "El borrado por edad esta APAGADO por defecto (0 = off).",
+    "El tier funciona con --layer-split (un archivo por etapa + sidecar conjunto).",
+    "Delta 2: con el tier encendido, --conversation-cache-spill-on vale park por defecto (espejo en tiempo real); evict reproduce delta 1 byte a byte. Sin tier, ninguna de las dos escribe nada.",
+    "El espejo del park escribe al cerrar el pedido, nunca a mitad de la generacion, y colapsa los parks de una conversacion (una celda por conversacion, solo el estado mas nuevo).",
+    "Una peticion cancelada deja un estado provisional: no publica copia durable y el estado vivo se revierte al ultimo limite de turno; la copia buena anterior no se toca.",
+    "Una copia cuyo encabezado coincide con el prompt entrante pero cuyo prefijo comun es menor a --conversation-cache-spill-divergence-tokens se descarta (compactacion); una de encabezado distinto es otra conversacion y no se toca."
+  ],
+  "no_afirmaciones": [
+    "La atencion es causal: no se puede conservar la cola de una conversacion bajo un system prompt distinto.",
+    "Un archivo de otro modelo o de otro cuant de KV se rechaza, no se reusa.",
+    "El tier de disco no acelera el camino que ya reutiliza: no arregla residencia de VRAM ni planificacion."
+  ]
+}

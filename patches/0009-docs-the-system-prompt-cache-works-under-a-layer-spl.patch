@@ -1,0 +1,77 @@
+From e8efacd0a7b0eb222c597fd43e6790860fd8f795 Mon Sep 17 00:00:00 2001
+From: Shahrokh <design@cariblanco.best>
+Date: Tue, 6 Oct 2026 22:26:04 -0600
+Subject: [PATCH 09/10] docs: the system-prompt cache works under a layer split
+ too
+
+FLAGS.md, DETAILS.md and SPILL_AND_PROMPT_CACHE.md still said the function runs
+on a single session and does not work with --layer-split.  It does: one session
+file per stage under the variant's key and a joint sidecar that carries the stage
+count (sidecar version 2; a version 1 single file is still read), and a variant
+stored while part of the context lived in host RAM loads back.  The --mtp
+requirement stands: without MTP the feature reports itself off.
+---
+ docs/DETAILS.md                | 6 ++++--
+ docs/FLAGS.md                  | 2 +-
+ docs/SPILL_AND_PROMPT_CACHE.md | 8 ++++++--
+ 3 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 8b0096a..bf04dc6 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -814,8 +814,10 @@ engine logs spill, restore and disk-budget events. The disk tier works with `--l
+ system prompt - the one `--prompt-cache-root` builds in RAM - as an ordinary session file in
+ `--system-prompt-cache-dir`, and reloads it at the next start, so a NEW chat of the same client reads only the
+ tokens after the root instead of the whole system prompt again. It is off by default (no directory is created, no
+-byte written), needs `--prompt-cache > 0`, `--prompt-cache-root > 0`, `--turn-token` and `--mtp`, and runs on a
+-single session (no `--layer-split`).
++byte written), needs `--prompt-cache > 0`, `--prompt-cache-root > 0`, `--turn-token` and `--mtp` (without MTP it
++reports itself off instead of capturing a different artifact). It works with `--layer-split` the way the disk tier
++does - one session file per stage under the variant's key, with a joint sidecar holding the stage count - and a
++variant stored while part of the context lived in host RAM loads back.
+ 
+ A variant is keyed by the hash of the exact system-prompt token prefix plus `--system-prompt-cache-key` (when
+ given) and the model/configuration identity, so only a prompt that begins with exactly those tokens can attach it.
+diff --git a/docs/FLAGS.md b/docs/FLAGS.md
+index 524c8a4..901e089 100644
+--- a/docs/FLAGS.md
++++ b/docs/FLAGS.md
+@@ -52,7 +52,7 @@ removes, by budget and (if enabled) by age, oldest first, with a counter and a l
+ 
+ | Flag | Default | What it does | Scope (when it applies and when it does NOT) | Limit or non-claim | Since |
+ | --- | --- | --- | --- | --- | --- |
+-| `--system-prompt-cache` | off | Turns the function on. The checkpoint root that ends the system prompt — already built in RAM by `--prompt-cache-root` — is written to disk as an ordinary session file, and reloaded at start so a NEW chat of the same client reads only the tokens after the root. | `--serve` only. Needs `--system-prompt-cache-dir`, `--prompt-cache > 0`, `--prompt-cache-root > 0`, a turn token and `--mtp`; runs on a single session (no `--layer-split`). Off unless set: no directory is created and no byte is written. | It persists a prefix, never a conversation tail: a stored variant opens only a prompt that **begins with exactly those tokens**. It changes what is read, not what the model computes. | `layer/delta1` |
++| `--system-prompt-cache` | off | Turns the function on. The checkpoint root that ends the system prompt — already built in RAM by `--prompt-cache-root` — is written to disk as an ordinary session file (one per stage under a layer split, with a joint sidecar), and reloaded at start so a NEW chat of the same client reads only the tokens after the root. | `--serve` only. Needs `--system-prompt-cache-dir`, `--prompt-cache > 0`, `--prompt-cache-root > 0`, a turn token and `--mtp` (without MTP it reports itself off rather than capturing a different artifact). Works with `--layer-split`, one session file per stage, and a variant stored while part of the context lived in host RAM loads back too. Off unless set: no directory is created and no byte is written. | It persists a prefix, never a conversation tail: a stored variant opens only a prompt that **begins with exactly those tokens**. It changes what is read, not what the model computes. | `layer/delta1` |
+ | `--system-prompt-cache-dir DIR` | empty | The cache's own folder, separate from the spill folder. | `--serve`; with `--system-prompt-cache`. Without it the function warns and stays off. | Use one folder per model/configuration: the identity check refuses a foreign file, and a folder shared across models just accumulates refused files. | `layer/delta1` |
+ | `--system-prompt-cache-mib N` | 2048 | The folder's byte budget. The GC trims variants over it, oldest first. | `--serve`; inside the system-prompt cache. | Budget, not a reservation. `0` means no byte budget (the variant count still applies). | `layer/delta1` |
+ | `--system-prompt-cache-slots N` | 2 | How many variants coexist. A variant is one exact system-prompt prefix (plus `--system-prompt-cache-key` and the model/config identity). The GC removes the oldest over this count. | `--serve`; inside the system-prompt cache. `0` means no variant cap (only the byte budget bounds it). | **A variant is never removed because the system prompt changed.** The old variant is kept and is a hit again if the client returns to it; only the GC removes one. `2` lets two prompts (for example two clients) alternate without re-reading each. | `layer/delta1` |
+diff --git a/docs/SPILL_AND_PROMPT_CACHE.md b/docs/SPILL_AND_PROMPT_CACHE.md
+index c1df731..87aad45 100644
+--- a/docs/SPILL_AND_PROMPT_CACHE.md
++++ b/docs/SPILL_AND_PROMPT_CACHE.md
+@@ -96,8 +96,8 @@ flowchart TD
+   `--conversation-cache-spill-when-full` chooses `evict-oldest` (default) or `reject`;
+   `--conversation-cache-spill-max-age-days` adds optional age pruning (0 = off).
+ - System-prompt cache: `--system-prompt-cache` with `--system-prompt-cache-dir DIR`. It also needs
+-  `--prompt-cache > 0`, `--prompt-cache-root > 0`, a turn token and `--mtp`, and runs on a single session (no
+-  `--layer-split`). Its folder is separate from the spill folder.
++  `--prompt-cache > 0`, `--prompt-cache-root > 0`, a turn token and `--mtp` (without MTP the feature reports
++  itself off rather than capturing a different artifact). Its folder is separate from the spill folder.
+ 
+ Both can be set in a config's `args` and edited from the Settings page (see `serve/runconfig.py`). The Monitor
+ shows their counters under `/metrics` in `conversation_cache` (`disk` and `system_prompt_cache`).
+@@ -105,6 +105,10 @@ shows their counters under `/metrics` in `conversation_cache` (`disk` and `syste
+ **Limits.**
+ 
+ - The disk tier works with `--layer-split`: one session file per stage plus one joint sidecar.
++- The system-prompt cache works with `--layer-split` too, the same way: one session file per stage under the
++  variant's key, and a joint sidecar holding the stage count (its sidecar is version 2; a version 1 file, the
++  single-file form, is still read). It also loads a variant whose K/V was stored while the engine kept part of
++  the context in host RAM.
+ - A disk hit is read into host RAM before it is restored: it must fit `--conversation-cache-mib` and leave the
+   `--conversation-cache-min-free-mib` floor available, or the request reads the prompt normally.
+ - The scan never deletes. A file of another identity, a broken or missing sidecar, an orphan session file and a
+-- 
+2.53.0.windows.2
+

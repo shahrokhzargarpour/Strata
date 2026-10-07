@@ -1,0 +1,1098 @@
+From 8a01693f4fb12aed494f3d7c539d076e7d6f8d33 Mon Sep 17 00:00:00 2001
+From: Shahrokh <design@cariblanco.best>
+Date: Tue, 6 Oct 2026 20:14:33 -0600
+Subject: [PATCH 05/10] system-prompt prefill cache (--system-prompt-cache*):
+ persist the prompt-cache root as a session file
+
+The checkpoint root that ends the system prompt, which lived only in RAM (--prompt-cache-root), is now persisted as an ordinary session file (the same format and identity as the slot save/restore API) in --system-prompt-cache-dir and reloaded at start, so a new chat of the same client reads only the tokens after it. A variant is keyed by the hash of the exact system-prompt token prefix + the optional declared key + the model/config identity, so attention's causality is never violated: a stored tail can never ride behind a different system prompt. A changed prefix is a miss, is reprocessed and rewritten (hash_changes counter + log), and the old variant stays until the GC (count/size/age, oldest first). Inert unless --system-prompt-cache. Also wires the F4 --conversation-cache-spill-when-full / -max-age-days flags into the CLI. conversation_prompt_cache_test: 52 checks.
+---
+ CMakeLists.txt                                |   6 +-
+ docs/DETAILS.md                               |  44 ++-
+ .../strata/core/conversation_prompt_cache.hpp | 119 ++++++
+ src/core/conversation_prompt_cache.cpp        | 350 ++++++++++++++++++
+ src/core/conversation_prompt_cache_test.cpp   | 187 ++++++++++
+ src/program/generate.cpp                      | 236 +++++++++++-
+ 6 files changed, 931 insertions(+), 11 deletions(-)
+ create mode 100644 include/strata/core/conversation_prompt_cache.hpp
+ create mode 100644 src/core/conversation_prompt_cache.cpp
+ create mode 100644 src/core/conversation_prompt_cache_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f113cf9..a3b3b96 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,6 +117,9 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
+   add_executable(conversation_spill_test src/core/conversation_spill_test.cpp src/core/conversation_spill.cpp src/core/conversation_file.cpp)
+   target_include_directories(conversation_spill_test PRIVATE include)
+   add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
++  add_executable(conversation_prompt_cache_test src/core/conversation_prompt_cache_test.cpp src/core/conversation_prompt_cache.cpp src/core/conversation_file.cpp)
++  target_include_directories(conversation_prompt_cache_test PRIVATE include)
++  add_test(NAME conversation_prompt_cache_test COMMAND conversation_prompt_cache_test)
+ endif()
+ 
+ if(STRATA_HIP_GFX906)
+@@ -440,7 +443,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_spill.cpp)
++    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_spill.cpp
++    src/core/conversation_prompt_cache.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index 6214c40..8b0096a 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -782,11 +782,22 @@ The index holds at most 256 conversations and evicts the oldest first. On a clea
+ captures the active conversation and spills the parked ones before it exits. Use a separate directory per model.
+ 
+ Each spilled conversation is a session file (`.sess`) plus a small metadata sidecar (`.meta`) that holds only its
+-token and image lists, so a new request finds the best disk match without reading the conversation's K/V. A file
+-whose recorded model or configuration identity differs is refused, and a sidecar whose session file is missing, or
+-whose own checksum fails, is removed when the directory is scanned. The identity is the same model fingerprint and
+-configuration fingerprint the session files below are bound to, so a spilled conversation and a hand-saved session
+-file are interchangeable.
++token and image lists, so a new request finds the best disk match without reading the conversation's K/V. The
++directory is only read when it is scanned: a file of another model/configuration identity, a sidecar whose session
++file is missing, a sidecar whose own checksum fails, an orphan session file and a leftover temporary are all
++ignored and counted (`foreign`, `stale`, `orphan`), never removed. Removal happens only in the GC. The identity is
++the same model fingerprint and configuration fingerprint the session files below are bound to, so a spilled
++conversation and a hand-saved session file are interchangeable. A layer-split conversation is one session file per
++stage (`<stem>.sess`, `<stem>.stage1.sess`, ...) plus one joint sidecar; the restore reads each stage with its own
++carve.
++
++`--conversation-cache-spill-when-full MODE` chooses what the GC does at the budget: `evict-oldest` (default, what
++Strata always did) drops the oldest conversation to make room; `reject` never evicts - a spill that would not fit is
++refused and logged, and nothing stored is removed. A conversation larger than the whole budget is always kept
++(counted as `oversized`), because removing it could not bring the directory under the budget.
++`--conversation-cache-spill-max-age-days N` is an independent, optional age lever: `0` (default) means no deletion
++by time at all; a positive N prunes conversations older than N days, oldest first, counted separately. Both counters
++appear in the start log and the shutdown line.
+ 
+ `--conversation-cache-similarity F` sets the least longest-common-prefix fraction of the new prompt a disk hit may
+ offer (the fraction is `common_prefix_tokens / new_prompt_tokens`, and must be strictly greater than F);
+@@ -797,8 +808,27 @@ the next verify window starts in the right position.
+ 
+ A disk hit is read into host RAM before it is restored: it must fit the configured RAM cache budget and leave the
+ `--conversation-cache-min-free-mib` physical-memory floor available, or the request reads the prompt normally. The
+-engine logs spill, restore, stale-file and disk-budget events. The disk tier keeps the existing single-GPU parking
+-limit: with `--layer-split` the disk tier stays off.
++engine logs spill, restore and disk-budget events. The disk tier works with `--layer-split` (one file per stage).
++
++**System-prompt prefill cache (opt-in).** `--system-prompt-cache` persists the checkpoint root that ends the
++system prompt - the one `--prompt-cache-root` builds in RAM - as an ordinary session file in
++`--system-prompt-cache-dir`, and reloads it at the next start, so a NEW chat of the same client reads only the
++tokens after the root instead of the whole system prompt again. It is off by default (no directory is created, no
++byte written), needs `--prompt-cache > 0`, `--prompt-cache-root > 0`, `--turn-token` and `--mtp`, and runs on a
++single session (no `--layer-split`).
++
++A variant is keyed by the hash of the exact system-prompt token prefix plus `--system-prompt-cache-key` (when
++given) and the model/configuration identity, so only a prompt that begins with exactly those tokens can attach it.
++Causality (the reason the key is the prefix's own hash): attention is causal, so a token's K/V was computed against
++the system prompt that was in front of it; attaching a stored tail to a different system prompt would corrupt every
++later token. When the system prompt changes its hash changes: the request is a miss, is reprocessed from the start
++(the system prompt is re-read) and is stored as its own variant, with a log line and a `hash_changes` counter. A
++variant is never removed because the system prompt changed - only the GC removes one, by count
++(`--system-prompt-cache-slots`, default 2; 0 = no cap) or size (`--system-prompt-cache-mib`, default 2048), oldest
++first, plus the optional `--system-prompt-cache-max-age-days` (0 = off). The scan never deletes. The metrics (hits,
++misses, tokens saved, bytes, live variants, evictions by space and age, hash changes) are logged at start and at
++shutdown. This is a disk-resident prefill cache: it does not change what the model computes, only how much of the
++system prompt is read again.
+ 
+ **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
+ restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
+diff --git a/include/strata/core/conversation_prompt_cache.hpp b/include/strata/core/conversation_prompt_cache.hpp
+new file mode 100644
+index 0000000..24695e9
+--- /dev/null
++++ b/include/strata/core/conversation_prompt_cache.hpp
+@@ -0,0 +1,119 @@
++// The system-prompt prefill cache (--system-prompt-cache): the checkpoint root that ends the system prompt, which
++// today lives only in RAM (--prompt-cache-root), persisted to disk as an ORDINARY SESSION FILE (conversation_file.cpp
++// - the same format, model/config identity and slot save/restore rules; NOT a second format) and reloaded at start.
++//
++// The artifact holds the running state and the K/V of EVERYTHING UP TO AND INCLUDING the end of the system prompt -
++// never a conversation tail. It is a resume point for a NEW chat whose system prompt is byte-for-byte the stored one:
++// a prompt that shares it reads only the tokens after it.
++//
++//   CAUSALITY (read this before changing the load path). A transformer's attention is causal: the K/V of a token is a
++//   function of that token and everything BEFORE it, and of the system prompt that was in front of it. A stored tail
++//   K/V therefore means nothing when it is placed behind a DIFFERENT system prompt - it would attend to a prefix the
++//   model never saw it attend to and silently corrupt every later token. So a variant is keyed by the EXACT hash of
++//   its system-prompt token prefix (plus the optional --system-prompt-cache-key and the model/config identity), and a
++//   loaded artifact is only ever attached as the root of a prompt that begins with exactly those tokens. If the
++//   system prompt changes, its hash changes: the old variant is not reused, the request is reprocessed from the start
++//   (only the system prompt is re-read), and the new prefix is written as its own variant. A variant is never removed
++//   because the system prompt changed - only the GC (space or age, oldest first) removes one.
++//
++// Pure host code: it calls the session-file writer/reader, which are host code too. Inert unless open() succeeds.
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/conversation_file.hpp"
++
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace strata::core {
++
++// A stored variant the caller may load (from the sidecar alone: no K/V read).
++struct ConversationPromptMatch {
++    std::string path;        // the session file to read back
++    uint64_t file_bytes = 0;
++    int64_t tokens = 0;      // the system-prompt prefix length the variant ends at
++    explicit operator bool() const { return !path.empty() && tokens > 0; }
++};
++
++class ConversationPromptCache {
++public:
++    // Opens (creating if needed) the cache directory and indexes the variants already in it. As with the spill
++    // directory the SCAN NEVER DELETES: a foreign-identity file, an unreadable sidecar, a variant whose session file
++    // is gone and an orphan session file are all ignored and counted. Removal happens only in the GC: the variant
++    // count/byte budget (--system-prompt-cache-slots / -mib) and the optional age lever (oldest first, with
++    // counters). `slots` <= 0 means no variant cap (only the byte budget); `max_age_days` <= 0 means no age pruning.
++    bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
++              int64_t slots, int64_t max_age_days, std::string& error);
++    bool enabled() const { return enabled_; }
++
++    // The key of a system-prompt token prefix: its token bytes + the optional declared key + this model/config
++    // identity, each length-delimited so two different field lists never collide (SessionIdentityBuilder).
++    uint64_t key_for(const int64_t* tokens, size_t count, const std::string& declared) const;
++
++    // A variant stored under this key, from its sidecar only. No K/V is read; the caller validates the prefix.
++    bool lookup(uint64_t key, ConversationPromptMatch& out) const;
++
++    // Counters the caller drives: a hit when a stored variant is reused (with the tokens it saved), a miss when the
++    // incoming prefix is not stored (a system-prompt change, or the first chat).
++    void note_hit(uint64_t key, int64_t tokens);
++    void note_miss(uint64_t key);
++
++    // Writes a variant. The two forms write the same file; `store_streamed` avoids a host K/V copy when the engine
++    // can stream the K/V (SessionKvSource), `store` takes an already captured image (tests, and the no-draft path).
++    bool store_streamed(uint64_t key, const SavedConversation& meta,
++                        const std::vector<SessionKvSource>& sources, std::string& error);
++    bool store(uint64_t key, const SavedConversation& image, std::string& error);
++    // Reads a variant back with the engine's read limits and identity (the session-file reader).
++    bool load(const std::string& path, SavedConversation& image,
++              const std::vector<SessionReadLimits>& limits, std::string& error) const;
++    bool erase(uint64_t key, std::string& error);
++
++    // Metrics.
++    size_t variants() const { return entries_.size(); }        // live variants
++    uint64_t bytes() const { return bytes_; }                  // bytes on disk
++    uint64_t hits() const { return hits_; }
++    uint64_t misses() const { return misses_; }
++    uint64_t tokens_saved() const { return tokens_saved_; }
++    uint64_t hash_changes() const { return hash_changes_; }    // new variants written beside an existing one
++    size_t evicted_by_space() const { return evicted_by_space_; }
++    size_t evicted_by_age() const { return evicted_by_age_; }
++    size_t foreign_files_kept() const { return foreign_files_kept_; }
++    size_t stale_files_kept() const { return stale_files_kept_; }
++    size_t orphan_files_kept() const { return orphan_files_kept_; }
++    size_t oversized_files_kept() const { return oversized_files_kept_; }
++
++private:
++    struct Entry {
++        uint64_t key = 0;
++        int64_t tokens = 0;
++        uint64_t file_bytes = 0;
++        std::filesystem::path session;
++        std::filesystem::path meta;
++        std::filesystem::file_time_type stamp{};
++        uint64_t hits = 0;
++    };
++    Entry* find(uint64_t key);
++    const Entry* find(uint64_t key) const;
++    void enforce();
++    bool remove_entry(size_t index);
++    std::filesystem::path variant_file(uint64_t key) const;
++    std::filesystem::path meta_file(uint64_t key) const;
++    bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
++    bool write_sidecar(const Entry& entry, std::string& error) const;
++    bool index_written(uint64_t key, int64_t tokens, uint64_t file_bytes, std::string& error);
++
++    bool enabled_ = false;
++    SessionFileIdentity identity_{};
++    uint64_t budget_ = 0, bytes_ = 0;
++    int64_t slots_ = 2, max_age_days_ = 0;
++    uint64_t hits_ = 0, misses_ = 0, tokens_saved_ = 0, hash_changes_ = 0;
++    size_t evicted_by_space_ = 0, evicted_by_age_ = 0, foreign_files_kept_ = 0, stale_files_kept_ = 0;
++    size_t orphan_files_kept_ = 0, oversized_files_kept_ = 0;
++    std::filesystem::path directory_;
++    std::vector<Entry> entries_;   // oldest variant first
++};
++
++} // namespace strata::core
+diff --git a/src/core/conversation_prompt_cache.cpp b/src/core/conversation_prompt_cache.cpp
+new file mode 100644
+index 0000000..6731a66
+--- /dev/null
++++ b/src/core/conversation_prompt_cache.cpp
+@@ -0,0 +1,350 @@
++// The system-prompt prefill cache: one ordinary session file per system-prompt prefix (a variant), a small sidecar
++// beside it holding the key, the prefix length and the file size, so a lookup never reads K/V. The session file is
++// the same format the slot save/restore API writes, so a variant and a hand-saved session are interchangeable and
++// the same model/config identity rules refuse a foreign file.
++//
++// Causality: the key is the hash of the exact system-prompt token prefix (see the header). A variant is only ever
++// attached to a prompt that begins with exactly those tokens; a changed system prompt is a different key, so its
++// variant is reprocessed and rewritten, and the old one stays until the GC removes it (space or age, oldest first).
++#include "strata/core/conversation_prompt_cache.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <new>
++#include <system_error>
++
++namespace strata::core {
++namespace {
++
++constexpr char kMetaMagic[4] = {'S', 'P', 'C', '1'};   // Strata Prompt Cache
++constexpr uint32_t kMetaVersion = 1;
++constexpr char kFilePrefix[] = "strata-prompt-";
++constexpr size_t kMetaBytes = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8;   // magic + version + model + config + key + tokens + file_bytes + digest
++
++std::string hex16(uint64_t v) {
++    char buffer[17];
++    std::snprintf(buffer, sizeof buffer, "%016llx", (unsigned long long) v);
++    return std::string(buffer, 16);
++}
++
++bool is_prompt_name(const std::string& name) { return name.rfind(kFilePrefix, 0) == 0; }
++
++template<class T>
++void put(std::string& out, T v) { out.append(reinterpret_cast<const char*>(&v), sizeof v); }
++
++void put_digest(std::string& out) {
++    SessionHasher h(0);
++    h.update(out.data(), out.size());
++    const uint64_t d = h.digest();
++    put(out, d);
++}
++
++} // namespace
++
++std::filesystem::path ConversationPromptCache::variant_file(uint64_t key) const {
++    return directory_ / (std::string(kFilePrefix) + hex16(key) + ".sess");
++}
++
++std::filesystem::path ConversationPromptCache::meta_file(uint64_t key) const {
++    return directory_ / (std::string(kFilePrefix) + hex16(key) + ".meta");
++}
++
++ConversationPromptCache::Entry* ConversationPromptCache::find(uint64_t key) {
++    for (Entry& e : entries_) if (e.key == key) return &e;
++    return nullptr;
++}
++
++const ConversationPromptCache::Entry* ConversationPromptCache::find(uint64_t key) const {
++    for (const Entry& e : entries_) if (e.key == key) return &e;
++    return nullptr;
++}
++
++bool ConversationPromptCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
++                                           std::string& error) const {
++    other_identity = false;
++    std::error_code ec;
++    const uint64_t file_bytes = std::filesystem::file_size(meta, ec);
++    if (ec || file_bytes < kMetaBytes) { error = "prompt cache sidecar is missing or too short"; return false; }
++    std::ifstream in(meta, std::ios::binary);
++    if (!in) { error = "cannot open prompt cache sidecar"; return false; }
++    std::string raw(kMetaBytes, '\0');
++    in.read(raw.data(), (std::streamsize) raw.size());
++    if (!in || in.gcount() != (std::streamsize) raw.size()) { error = "truncated prompt cache sidecar"; return false; }
++    size_t at = 0;
++    auto take = [&](void* p, size_t n) { std::memcpy(p, raw.data() + at, n); at += n; };
++    char magic[4];
++    uint32_t version = 0;
++    uint64_t model = 0, config = 0, key = 0, stored_bytes = 0, digest = 0;
++    int64_t tokens = 0;
++    take(magic, 4); take(&version, 4); take(&model, 8); take(&config, 8); take(&key, 8); take(&tokens, 8);
++    take(&stored_bytes, 8); take(&digest, 8);
++    if (std::memcmp(magic, kMetaMagic, 4) != 0 || version != kMetaVersion) {
++        error = "unknown prompt cache sidecar magic or version"; return false;
++    }
++    SessionHasher h(0);
++    h.update(raw.data(), at - 8);
++    if (h.digest() != digest) { error = "prompt cache sidecar checksum mismatch"; return false; }
++    if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
++    if (tokens <= 0) { error = "invalid prompt cache token count"; return false; }
++    entry.key = key;
++    entry.tokens = tokens;
++    entry.file_bytes = stored_bytes;
++    return true;
++}
++
++bool ConversationPromptCache::write_sidecar(const Entry& entry, std::string& error) const {
++    std::string raw;
++    raw.reserve(kMetaBytes);
++    raw.append(kMetaMagic, 4);
++    put(raw, (uint32_t) kMetaVersion);
++    put(raw, (uint64_t) identity_.model);
++    put(raw, (uint64_t) identity_.config);
++    put(raw, (uint64_t) entry.key);
++    put(raw, (int64_t) entry.tokens);
++    put(raw, (uint64_t) entry.file_bytes);
++    put_digest(raw);
++    const std::filesystem::path temporary(entry.meta.string() + ".tmp");
++    {
++        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
++        if (!out) { error = "cannot create prompt cache sidecar"; return false; }
++        out.write(raw.data(), (std::streamsize) raw.size());
++        out.flush();
++        if (!out) { error = "cannot write prompt cache sidecar"; return false; }
++    }
++    std::error_code ec;
++    std::filesystem::rename(temporary, entry.meta, ec);
++    if (ec) { std::filesystem::remove(temporary, ec); error = "cannot commit prompt cache sidecar"; return false; }
++    return true;
++}
++
++bool ConversationPromptCache::open(const std::filesystem::path& directory, SessionFileIdentity identity,
++                                   uint64_t budget_bytes, int64_t slots, int64_t max_age_days, std::string& error) {
++    enabled_ = false;
++    entries_.clear();
++    bytes_ = 0;
++    hits_ = misses_ = tokens_saved_ = hash_changes_ = 0;
++    evicted_by_space_ = evicted_by_age_ = 0;
++    foreign_files_kept_ = stale_files_kept_ = orphan_files_kept_ = oversized_files_kept_ = 0;
++    directory_ = directory;
++    identity_ = identity;
++    budget_ = budget_bytes;
++    slots_ = slots;
++    max_age_days_ = max_age_days < 0 ? 0 : max_age_days;
++    if (directory.empty() || !identity.model || !identity.config) return true;
++    try {
++        std::error_code ec;
++        std::filesystem::create_directories(directory_, ec);
++        if (ec || !std::filesystem::is_directory(directory_, ec) || ec) {
++            error = "cannot create or inspect prompt cache directory " + directory_.string(); return false;
++        }
++        // The scan only reads. A leftover temporary, a broken sidecar, a foreign identity and an orphan session file
++        // are counted and left in place; removal is the GC's, below.
++        std::vector<std::filesystem::path> metas, session_files;
++        for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
++            const auto status = it->symlink_status(ec);
++            if (ec) break;
++            const std::string name = it->path().filename().string();
++            if (!is_prompt_name(name)) continue;
++            if (!std::filesystem::is_regular_file(status)) continue;
++            const std::string ext = it->path().extension().string();
++            if (ext == ".meta") metas.push_back(it->path());
++            else if (ext == ".sess") session_files.push_back(it->path());
++            else ++stale_files_kept_;   // a leftover temporary or an unknown kind: reported, never removed
++        }
++        if (ec) { error = "cannot scan prompt cache directory " + directory_.string(); return false; }
++        std::sort(metas.begin(), metas.end());
++        for (const auto& meta : metas) {
++            Entry entry;
++            entry.meta = meta;
++            bool other_identity = false;
++            std::string parse_error;
++            if (!read_sidecar(meta, entry, other_identity, parse_error)) {
++                if (other_identity) ++foreign_files_kept_;
++                else ++stale_files_kept_;
++                continue;   // ignored, not removed
++            }
++            entry.session = variant_file(entry.key);
++            std::error_code sec;
++            const uint64_t session_bytes = std::filesystem::file_size(entry.session, sec);
++            if (sec || session_bytes == 0) { ++stale_files_kept_; continue; }   // session gone: the sidecar is useless, kept
++            entry.file_bytes = session_bytes;
++            entry.stamp = std::filesystem::last_write_time(entry.session, sec);
++            if (sec) entry.stamp = {};
++            if (budget_ && session_bytes > budget_) ++oversized_files_kept_;   // KEPT: the GC leaves it alone too
++            entries_.push_back(std::move(entry));
++            bytes_ += session_bytes;
++        }
++        // A session file with no sidecar left behind (a crash between the two writes) would never be matched.
++        for (const auto& path : session_files) {
++            std::filesystem::path meta = path;
++            meta.replace_extension(".meta");
++            if (!std::filesystem::exists(meta, ec) && !ec) ++orphan_files_kept_;
++            ec.clear();
++        }
++        enabled_ = true;
++        enforce();
++        return true;
++    } catch (const std::bad_alloc&) {
++        entries_.clear(); bytes_ = 0; enabled_ = false;
++        error = "not enough RAM to index prompt cache directory"; return false;
++    } catch (const std::exception& e) {
++        entries_.clear(); bytes_ = 0; enabled_ = false;
++        error = std::string("cannot index prompt cache directory: ") + e.what(); return false;
++    }
++}
++
++uint64_t ConversationPromptCache::key_for(const int64_t* tokens, size_t count, const std::string& declared) const {
++    SessionIdentityBuilder b(0x5350524f4d505443ull);   // "SPROMPTC"
++    b.str("kind", "system-prompt-prefix");
++    b.u64("model", identity_.model);
++    b.u64("config", identity_.config);
++    b.str("declared", declared);
++    b.bytes("tokens", tokens, count * sizeof(int64_t));
++    return b.digest();
++}
++
++bool ConversationPromptCache::lookup(uint64_t key, ConversationPromptMatch& out) const {
++    out = {};
++    if (!enabled_) return false;
++    const Entry* entry = find(key);
++    if (entry == nullptr) return false;
++    out.path = entry->session.string();
++    out.file_bytes = entry->file_bytes;
++    out.tokens = entry->tokens;
++    return true;
++}
++
++void ConversationPromptCache::note_hit(uint64_t key, int64_t tokens) {
++    if (!enabled_) return;
++    Entry* entry = find(key);
++    if (entry != nullptr) ++entry->hits;
++    ++hits_;
++    if (tokens > 0) tokens_saved_ += (uint64_t) tokens;
++}
++
++void ConversationPromptCache::note_miss(uint64_t key) {
++    (void) key;
++    if (!enabled_) return;
++    ++misses_;
++}
++
++bool ConversationPromptCache::erase(uint64_t key, std::string& error) {
++    if (!enabled_) return false;
++    Entry* entry = find(key);
++    if (entry == nullptr) return true;
++    const size_t index = (size_t) (entry - entries_.data());
++    if (!remove_entry(index)) { error = "cannot remove prompt cache variant"; return false; }
++    return true;
++}
++
++bool ConversationPromptCache::index_written(uint64_t key, int64_t tokens, uint64_t file_bytes, std::string& error) {
++    std::error_code ec;
++    const std::filesystem::path session = variant_file(key);
++    Entry entry;
++    entry.key = key;
++    entry.tokens = tokens;
++    entry.file_bytes = file_bytes;
++    entry.session = session;
++    entry.meta = meta_file(key);
++    entry.stamp = std::filesystem::last_write_time(session, ec);
++    if (ec) entry.stamp = {};
++    if (!write_sidecar(entry, error)) return false;
++    const bool known = find(key) != nullptr;
++    if (!known) {
++        // A new key beside a stored variant: the system prompt changed (or a second one is in use). Counted.
++        if (!entries_.empty()) ++hash_changes_;
++        try {
++            entries_.push_back(std::move(entry));
++        } catch (const std::bad_alloc&) {
++            std::error_code rec;
++            std::filesystem::remove(session, rec);
++            std::filesystem::remove(meta_file(key), rec);
++            error = "not enough RAM to index the prompt cache variant"; return false;
++        }
++        bytes_ += file_bytes;
++    } else {
++        Entry* existing = find(key);
++        bytes_ -= existing->file_bytes;
++        *existing = std::move(entry);
++        bytes_ += file_bytes;
++    }
++    if (budget_ && file_bytes > budget_) ++oversized_files_kept_;
++    enforce();
++    return true;
++}
++
++bool ConversationPromptCache::store(uint64_t key, const SavedConversation& image, std::string& error) {
++    if (!enabled_) return false;
++    const std::filesystem::path session = variant_file(key);
++    size_t bytes = 0;
++    SessionWriteOptions wo;
++    wo.durable = true;
++    SessionStatus st;
++    if (!session_file_write(session.string(), image, identity_, bytes, error, wo, &st)) return false;
++    return index_written(key, (int64_t) image.live.ids.size(), bytes, error);
++}
++
++bool ConversationPromptCache::store_streamed(uint64_t key, const SavedConversation& meta,
++                                             const std::vector<SessionKvSource>& sources, std::string& error) {
++    if (!enabled_) return false;
++    const std::filesystem::path session = variant_file(key);
++    size_t bytes = 0;
++    SessionWriteOptions wo;
++    wo.durable = true;
++    SessionStatus st;
++    if (!session_file_write(session.string(), meta, sources, identity_, bytes, error, wo, &st)) return false;
++    return index_written(key, (int64_t) meta.live.ids.size(), bytes, error);
++}
++
++bool ConversationPromptCache::load(const std::string& path, SavedConversation& image,
++                                   const std::vector<SessionReadLimits>& limits, std::string& error) const {
++    if (!enabled_) { error = "prompt cache is disabled"; return false; }
++    size_t bytes = 0;
++    if (limits.empty()) return session_file_read(path, identity_, image, bytes, error);
++    return session_file_read(path, identity_, image, bytes, error, limits[0]);
++}
++
++bool ConversationPromptCache::remove_entry(size_t index) {
++    const Entry& entry = entries_[index];
++    std::error_code ec;
++    const bool removed = std::filesystem::remove(entry.session, ec);
++    ec.clear();
++    if (!removed && std::filesystem::exists(entry.session)) return false;
++    std::filesystem::remove(entry.meta, ec);
++    bytes_ -= entry.file_bytes;
++    entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
++    return true;
++}
++
++void ConversationPromptCache::enforce() {
++    // oldest first by write time; a few entries, so sorting on each pass is cheap and keeps the order honest.
++    std::sort(entries_.begin(), entries_.end(), [](const Entry& a, const Entry& b) { return a.stamp < b.stamp; });
++    if (max_age_days_ > 0) {
++        const std::filesystem::file_time_type now = std::filesystem::file_time_type::clock::now();
++        const std::chrono::seconds limit((int64_t) max_age_days_ * 86400);
++        for (size_t i = 0; i < entries_.size();) {
++            if (now - entries_[i].stamp < limit) { ++i; continue; }
++            if (!remove_entry(i)) { ++i; continue; }
++            ++evicted_by_age_;
++        }
++    }
++    auto space_evict = [&](bool by_slots) -> bool {
++        // oldest variant that can actually be removed (one larger than the whole budget cannot bring bytes_ under it)
++        for (size_t i = 0; i < entries_.size(); ++i) {
++            if (budget_ && entries_[i].file_bytes > budget_ && !by_slots) continue;
++            if (!remove_entry(i)) continue;
++            ++evicted_by_space_;
++            return true;
++        }
++        return false;
++    };
++    if (slots_ > 0)
++        while ((int64_t) entries_.size() > slots_) if (!space_evict(true)) break;
++    while (budget_ > 0 && bytes_ > budget_) if (!space_evict(false)) break;
++}
++
++} // namespace strata::core
+diff --git a/src/core/conversation_prompt_cache_test.cpp b/src/core/conversation_prompt_cache_test.cpp
+new file mode 100644
+index 0000000..2f297e6
+--- /dev/null
++++ b/src/core/conversation_prompt_cache_test.cpp
+@@ -0,0 +1,187 @@
++// CPU-only tests for the system-prompt prefill cache (include/strata/core/conversation_prompt_cache.hpp): a variant
++// is a session file keyed by the hash of a system-prompt token prefix, matched from its sidecar, reloaded whole, and
++// never removed because the prefix changed - only the GC (space or age, oldest first) removes one.
++// Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
++#include "strata/core/conversation_prompt_cache.hpp"
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++using namespace strata::core;
++namespace fs = std::filesystem;
++
++namespace {
++int checks = 0;
++void check(bool ok, const char* label) {
++    ++checks;
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++
++ConversationBuffer pattern(size_t n, uint8_t seed) {
++    ConversationBuffer b;
++    b.resize(n);
++    b.visit(0, n, [&](uint8_t* p, size_t c, size_t at) {
++        for (size_t i = 0; i < c; ++i) p[i] = uint8_t((at + i) * 131u + seed);
++        return true;
++    });
++    return b;
++}
++std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
++    std::vector<uint8_t> v(n);
++    for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
++    return v;
++}
++ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed) {
++    ConversationCheckpoint c;
++    for (size_t i = 0; i < tokens; ++i) c.ids.push_back(int32_t(1000 + i));
++    c.gdn = bytes_of(4099, seed); c.ple = bytes_of(77, seed + 1);
++    c.tails = bytes_of(301, seed + 2); c.dead = bytes_of(64, seed + 3); c.block_pos = bytes_of(8, seed + 4);
++    c.used = 42 + seed;
++    return c;
++}
++SavedConversation sample(size_t tokens) {
++    SavedConversation s;
++    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
++    s.layer_lo = 0; s.layer_hi = 48; s.cvec = false;
++    s.live = checkpoint(tokens, 1);
++    s.checkpoints.push_back(checkpoint(tokens / 4, 2));
++    s.checkpoints.push_back(checkpoint(tokens / 2, 3));
++    for (int layer = 0; layer < 2; ++layer) {
++        ConversationKv kv;
++        kv.format = 2 + layer; kv.cells = 1024; kv.heads = 2; kv.head_dim = 256;
++        kv.page_size = 64; kv.pooled_rows = 9; kv.idx_dim = 128;
++        kv.k = pattern(4096, uint8_t(layer)); kv.v = pattern(4096 + layer, uint8_t(layer + 10));
++        kv.k_scale = pattern(512, uint8_t(layer + 20)); kv.v_scale = pattern(512, uint8_t(layer + 30));
++        kv.pooled = pattern(9 * 128 * 4, uint8_t(layer + 40));
++        s.kv.push_back(std::move(kv));
++    }
++    return s;
++}
++size_t count_sess(const fs::path& dir) {
++    size_t n = 0;
++    for (const auto& e : fs::directory_iterator(dir))
++        if (e.path().extension() == ".sess") ++n;
++    return n;
++}
++} // namespace
++
++int main() {
++    const fs::path dir = fs::temp_directory_path() / ("strata-prompt-cache-test-" + std::to_string(
++        std::chrono::steady_clock::now().time_since_epoch().count()));
++    fs::remove_all(dir);
++    SessionFileIdentity id{0x1111222233334444ull, 0x5555666677778888ull};
++    std::string error;
++
++    // ---- inert: a closed cache writes nothing and answers nothing ----
++    ConversationPromptCache off;
++    ConversationPromptMatch match;
++    check(!off.enabled(), "closed cache disabled");
++    check(!off.lookup(123, match), "closed cache has no lookup");
++    SavedConversation first = sample(1000);
++    check(!off.store(123, first, error), "closed cache refuses a store");
++    check(!fs::exists(dir), "closed cache wrote nothing to disk");
++
++    // ---- open, store a variant, hit it ----
++    ConversationPromptCache cache;
++    check(cache.open(dir, id, 1ull << 30, 2, 0, error), "open");
++    check(cache.enabled(), "enabled");
++    check(cache.variants() == 0, "empty index");
++    std::vector<int64_t> prefix1(first.live.ids.begin(), first.live.ids.end());
++    const uint64_t k1 = cache.key_for(prefix1.data(), prefix1.size(), "");
++    check(!cache.lookup(k1, match), "no variant yet");
++    cache.note_miss(k1);
++    check(cache.store(k1, first, error), "store the first variant");
++    check(cache.variants() == 1, "one variant");
++    check(cache.lookup(k1, match) && match.tokens == (int64_t) first.live.ids.size(), "hit own variant");
++    cache.note_hit(k1, match.tokens);
++    check(cache.hits() == 1 && cache.misses() == 1, "hit and miss counters");
++    check(cache.tokens_saved() == (uint64_t) first.live.ids.size(), "tokens saved counted");
++    check(cache.bytes() > 0, "bytes on disk counted");
++    check(cache.hash_changes() == 0, "the first store is not a hash change");
++
++    // read it back whole
++    SavedConversation back;
++    check(cache.load(match.path, back, {}, error), "load the variant");
++    check(back.live.ids == first.live.ids, "ids round-trip");
++    check(back.kv.size() == first.kv.size(), "kv layer count round-trip");
++
++    // ---- a restart: the variant is a hit again ----
++    ConversationPromptCache again;
++    check(again.open(dir, id, 1ull << 30, 2, 0, error), "reopen");
++    check(again.variants() == 1, "variant survives a reopen");
++    check(again.lookup(k1, match) && match.tokens == (int64_t) first.live.ids.size(), "hit after reopen");
++    check(again.load(match.path, back, {}, error) && back.live.ids == first.live.ids, "load after reopen");
++
++    // ---- a changed system-prompt prefix: miss + rewrite; the old variant stays ----
++    std::vector<int64_t> prefix2 = prefix1;
++    prefix2[999] += 1;   // the prefix diverges inside the system prompt
++    const uint64_t k2 = again.key_for(prefix2.data(), prefix2.size(), "");
++    check(k2 != k1, "a different prefix gives a different key");
++    check(!again.lookup(k2, match), "the changed prefix is a miss");
++    again.note_miss(k2);
++    SavedConversation second = sample(1200);
++    check(again.store(k2, second, error), "rewrite as a second variant");
++    check(again.variants() == 2, "two variants coexist");
++    check(again.hash_changes() == 1, "the hash change is counted");
++    check(again.lookup(k1, match), "the old variant is still a hit");
++    check(again.lookup(k2, match), "the new variant is a hit");
++    // the declared --system-prompt-cache-key enters the key too
++    check(again.key_for(prefix1.data(), prefix1.size(), "declared") != k1, "the declared key changes the key");
++
++    // ---- a foreign identity is ignored and never removed ----
++    ConversationPromptCache foreign;
++    check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, 2, 0, error), "open with a foreign identity");
++    check(foreign.variants() == 0, "foreign identity indexes nothing");
++    check(foreign.foreign_files_kept() >= 1, "foreign identity reported, not removed");
++    check(count_sess(dir) >= 2, "another identity's variants are left alone");
++
++    // ---- slots: a third variant evicts the oldest ----
++    std::vector<int64_t> prefix3 = prefix1;
++    prefix3[998] += 7;
++    const uint64_t k3 = again.key_for(prefix3.data(), prefix3.size(), "");
++    check(again.store(k3, sample(800), error), "store a third variant");
++    check(again.variants() == 2, "slots=2 keeps two variants");
++    check(again.evicted_by_space() >= 1, "the oldest variant is evicted by the slot GC");
++
++    // ---- max-age-days 0: no deletion by time ----
++    ConversationPromptCache age0;
++    check(age0.open(dir, id, 1ull << 30, 2, 0, error), "open with max-age 0");
++    const size_t before_age = age0.variants();
++    check(before_age >= 1, "variants present before the age test");
++    check(age0.evicted_by_age() == 0, "max-age 0 deletes nothing by time");
++    check(age0.variants() == before_age, "max-age 0 keeps every variant");
++
++    // ---- max-age-days positive: prune the old ones, oldest first ----
++    const auto old = fs::file_time_type::clock::now() - std::chrono::hours(24 * 10);
++    for (const auto& e : fs::directory_iterator(dir))
++        if (e.path().extension() == ".sess") fs::last_write_time(e.path(), old);
++    ConversationPromptCache age7;
++    check(age7.open(dir, id, 1ull << 30, 2, 7, error), "open with max-age 7 days");
++    check(age7.evicted_by_age() >= 1, "variants older than the limit are pruned");
++    check(age7.variants() == 0, "every old variant went");
++
++    // ---- a variant larger than the whole budget is KEPT and reported ----
++    const fs::path tiny_dir = dir.string() + "-tiny";
++    fs::remove_all(tiny_dir);
++    ConversationPromptCache tiny;
++    check(tiny.open(tiny_dir, id, 4096, 2, 0, error), "open with a tiny budget");
++    SavedConversation big = sample(1000);
++    const uint64_t tk = tiny.key_for(prefix1.data(), prefix1.size(), "");
++    check(tiny.store(tk, big, error), "store a variant over the budget");
++    check(tiny.variants() == 1, "the oversized variant is indexed, not dropped");
++    check(tiny.bytes() > 4096, "it is larger than the budget");
++    check(tiny.oversized_files_kept() >= 1, "reported as oversized");
++    ConversationPromptCache tiny_again;
++    check(tiny_again.open(tiny_dir, id, 4096, 2, 0, error), "reopen the tiny budget");
++    check(tiny_again.variants() == 1, "the oversized variant survives a reopen");
++    check(tiny_again.oversized_files_kept() >= 1, "reported oversized on reopen");
++
++    fs::remove_all(dir);
++    fs::remove_all(tiny_dir);
++    std::printf("conversation_prompt_cache_test: %d checks passed\n", checks);
++    return 0;
++}
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index a417756..0961b1a 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -23,6 +23,7 @@
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/conversation_spill.hpp"
++#include "strata/core/conversation_prompt_cache.hpp"
+ #include "strata/core/coupled_draft.hpp"
+ #include "strata/core/expert_source.hpp"
+ #include "strata/core/pinned.hpp"
+@@ -596,6 +597,21 @@ struct Options {
+     int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
+     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
+     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
++    /// --conversation-cache-spill-when-full: what the disk tier does at its budget. "evict-oldest" (default, what
++    /// upstream always did) has the GC drop the oldest conversation; "reject" refuses a new spill and removes nothing.
++    std::string conversation_cache_spill_when_full = "evict-oldest";
++    /// --conversation-cache-spill-max-age-days: optional age pruning of the spill directory (0 = off, no deletion
++    /// by time at all; positive = the GC drops conversations older than that, oldest first).
++    int64_t conversation_cache_spill_max_age_days = 0;
++    /// --system-prompt-cache (F5, opt-in): persist the checkpoint root that ends the system prompt (the one
++    /// --prompt-cache-root builds in RAM) as an ordinary session file, and reload it at start so a NEW chat reads
++    /// only the tokens after it. Off by default: no directory is created and no byte is written.
++    bool system_prompt_cache = false;
++    std::string system_prompt_cache_dir;          ///< its own folder, separate from the spill directory
++    int64_t system_prompt_cache_mib = 2048;       ///< the folder's byte budget (0 = no byte budget)
++    int64_t system_prompt_cache_slots = 2;        ///< how many system-prompt variants coexist (0 = no cap)
++    int64_t system_prompt_cache_max_age_days = 0; ///< optional age pruning (0 = off)
++    std::string system_prompt_cache_key;          ///< an optional declared identity, added to the key
+     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
+     int64_t prompt_cache_every = 16384;
+     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
+@@ -741,6 +757,21 @@ void usage() {
+                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
+                  "                       (default 0 = any; range [0,1))\n"
+                  "  --conversation-cache-n-min N  --serve: least common-prefix tokens a disk hit may offer (default 0)\n"
++                 "  --conversation-cache-spill-when-full MODE  --serve: at the spill directory's budget, evict-oldest\n"
++                 "                       (default) drops the oldest conversation, reject refuses the new spill and\n"
++                 "                       removes nothing\n"
++                 "  --conversation-cache-spill-max-age-days N  --serve: prune spill conversations older than N days,\n"
++                 "                       oldest first (default 0 = off; no deletion by time at all)\n"
++                 "  --system-prompt-cache  --serve: persist the system-prompt checkpoint root (--prompt-cache-root) to\n"
++                 "                       disk and reload it at start, so a new chat of the same client reads only the\n"
++                 "                       tokens after it (default off; needs --system-prompt-cache-dir)\n"
++                 "  --system-prompt-cache-dir DIR  --serve: the system-prompt cache's own folder (separate from the\n"
++                 "                       spill directory)\n"
++                 "  --system-prompt-cache-mib N  --serve: that folder's byte budget (default 2048)\n"
++                 "  --system-prompt-cache-slots N  --serve: how many system-prompt variants coexist (default 2; 0 = no cap)\n"
++                 "  --system-prompt-cache-max-age-days N  --serve: prune variants older than N days, oldest first\n"
++                 "                       (default 0 = off)\n"
++                 "  --system-prompt-cache-key STR  --serve: an optional declared identity added to the variant key\n"
+                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
+                  "                       give VRAM back to other programs between requests and take it back later\n"
+@@ -1750,6 +1781,43 @@ int main(int argc, char** argv) {
+             }
+             o.conversation_cache_similarity = similarity;
+         }
++        else if (a == "--conversation-cache-spill-when-full") {
++            const std::string value = next("--conversation-cache-spill-when-full");
++            if (value != "evict-oldest" && value != "reject") {
++                std::fprintf(stderr, "--conversation-cache-spill-when-full takes evict-oldest or reject\n");
++                return 2;
++            }
++            o.conversation_cache_spill_when_full = value;
++        }
++        else if (a == "--conversation-cache-spill-max-age-days") {
++            const std::string value = next("--conversation-cache-spill-max-age-days");
++            int64_t number = 0;
++            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
++            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 ||
++                number > INT64_MAX / 86400) {
++                std::fprintf(stderr, "--conversation-cache-spill-max-age-days needs a nonnegative integer within range\n");
++                return 2;
++            }
++            o.conversation_cache_spill_max_age_days = number;
++        }
++        else if (a == "--system-prompt-cache") o.system_prompt_cache = true;
++        else if (a == "--system-prompt-cache-dir") o.system_prompt_cache_dir = next("--system-prompt-cache-dir");
++        else if (a == "--system-prompt-cache-key") o.system_prompt_cache_key = next("--system-prompt-cache-key");
++        else if (a == "--system-prompt-cache-mib" || a == "--system-prompt-cache-slots" ||
++                 a == "--system-prompt-cache-max-age-days") {
++            const std::string value = next(a.c_str());
++            int64_t number = 0;
++            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
++            const int64_t limit = a == "--system-prompt-cache-slots" ? INT32_MAX :
++                                  a == "--system-prompt-cache-max-age-days" ? INT64_MAX / 86400 : INT64_MAX / (1024 * 1024);
++            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
++                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
++                return 2;
++            }
++            if (a == "--system-prompt-cache-mib") o.system_prompt_cache_mib = number;
++            else if (a == "--system-prompt-cache-slots") o.system_prompt_cache_slots = number;
++            else o.system_prompt_cache_max_age_days = number;
++        }
+         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
+@@ -1895,6 +1963,12 @@ int main(int argc, char** argv) {
+          o.conversation_cache_disk_mib == 0))
+         std::fprintf(stderr, "strata serve: warning: the disk conversation cache needs --conversation-cache-mib, "
+                              "--prompt-cache, --conversation-cache-slots and a nonzero --conversation-cache-disk-mib\n");
++    if (o.serve && o.system_prompt_cache && o.system_prompt_cache_dir.empty())
++        std::fprintf(stderr, "strata serve: warning: --system-prompt-cache needs --system-prompt-cache-dir; it stays off\n");
++    if (o.serve && o.system_prompt_cache && !o.system_prompt_cache_dir.empty() &&
++        (o.prompt_cache <= 0 || o.prompt_cache_root <= 0 || o.turn_token < 0))
++        std::fprintf(stderr, "strata serve: warning: the system prompt cache needs --prompt-cache > 0, "
++                             "--prompt-cache-root > 0 and a turn token; it will not find a root to save\n");
+     // parking with --layer-split saves every stage (SavedConversation::stage_images)
+     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
+     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
+@@ -6428,15 +6502,51 @@ int main(int argc, char** argv) {
+             } else {
+                 std::string spill_error;
+                 if (!conversation_spill.open(o.conversation_cache_spill_dir, spill_identity,
+-                        (uint64_t) o.conversation_cache_disk_mib * 1024 * 1024, spill_error)) {
++                        (uint64_t) o.conversation_cache_disk_mib * 1024 * 1024, spill_error,
++                        o.conversation_cache_spill_when_full == "reject" ? strata::core::SpillWhenFull::reject
++                                                                         : strata::core::SpillWhenFull::evict_oldest,
++                        o.conversation_cache_spill_max_age_days)) {
+                     std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", spill_error.c_str());
+                 } else if (conversation_spill.enabled()) {
+                     std::fprintf(stderr, "strata serve: conversation cache: spill dir ready (%zu conversations, %llu MiB, "
+-                                 "%zu oversized kept, %zu stale kept, %zu foreign kept, %zu orphans kept, %zu disk evictions)\n",
++                                 "when-full=%s, max-age=%lld d, %zu oversized kept, %zu stale kept, %zu foreign kept, "
++                                 "%zu orphans kept, %zu disk evictions, %zu age evictions)\n",
+                                  conversation_spill.size(), (unsigned long long) (conversation_spill.bytes() >> 20),
++                                 o.conversation_cache_spill_when_full.c_str(),
++                                 (long long) o.conversation_cache_spill_max_age_days,
+                                  conversation_spill.oversized_files_kept(), conversation_spill.stale_files_kept(),
+                                  conversation_spill.foreign_files_kept(), conversation_spill.orphan_files_kept(),
+-                                 conversation_spill.disk_evictions());
++                                 conversation_spill.disk_evictions(), conversation_spill.age_evictions());
++                }
++            }
++        }
++        // The system-prompt prefill cache (F5): the checkpoint root that ends the system prompt (--prompt-cache-root)
++        // persisted as an ordinary session file and reloaded at start, so a NEW chat of the same client reads only
++        // the tokens after it.  Its own directory, its own budget, its own variant count.  Off unless
++        // --system-prompt-cache; single-session only (no layer split), because the artifact is one session file of
++        // this engine's own carve.
++        // A session with the draft layer (--mtp) only: the disk save streams the K/V (conversation_snapshot_sources),
++        // which needs the draft's own K/V to be part of the artifact, and the restore path checks for it. Without
++        // --mtp the feature stays off (reported) rather than capturing a different artifact.
++        strata::core::ConversationPromptCache system_prompt_cache;
++        strata::core::SessionFileIdentity system_prompt_identity;
++        if (o.serve && o.system_prompt_cache && !o.system_prompt_cache_dir.empty() && stages.empty() && use_mtp) {
++            std::string identity_error;
++            if (!session_identity(system_prompt_identity, identity_error, nullptr)) {
++                std::fprintf(stderr, "strata serve: system prompt cache: disabled (%s)\n", identity_error.c_str());
++            } else {
++                std::string sp_error;
++                if (!system_prompt_cache.open(o.system_prompt_cache_dir, system_prompt_identity,
++                        (uint64_t) o.system_prompt_cache_mib * 1024 * 1024, o.system_prompt_cache_slots,
++                        o.system_prompt_cache_max_age_days, sp_error)) {
++                    std::fprintf(stderr, "strata serve: system prompt cache: disabled (%s)\n", sp_error.c_str());
++                } else if (system_prompt_cache.enabled()) {
++                    std::fprintf(stderr, "strata serve: system prompt cache: ready (%zu variants, %llu MiB, slots=%lld, "
++                                 "max-age=%lld d, %zu foreign kept, %zu stale kept, %zu orphans kept, %zu oversized kept)\n",
++                                 system_prompt_cache.variants(), (unsigned long long) (system_prompt_cache.bytes() >> 20),
++                                 (long long) o.system_prompt_cache_slots, (long long) o.system_prompt_cache_max_age_days,
++                                 system_prompt_cache.foreign_files_kept(), system_prompt_cache.stale_files_kept(),
++                                 system_prompt_cache.orphan_files_kept(), system_prompt_cache.oversized_files_kept());
+                 }
+             }
+         }
+@@ -8466,6 +8576,82 @@ int main(int argc, char** argv) {
+                     }
+                 }
+             }
++            // F5: the system-prompt prefill cache. A stored variant whose EXACT system-prompt prefix this prompt
++            // begins with is the checkpoint root of a new chat: loading it parks the outgoing session and this request
++            // reads only the tokens after the root. CAUSALITY: the key is the hash of the prefix's own tokens, and the
++            // loaded root is checked to be exactly this prompt's first tokens before it is used, so a stored tail K/V
++            // can never ride behind a different system prompt. A changed system prompt is a different key: it misses,
++            // is reprocessed from the start and is stored as its own variant (the old one is kept for the GC).
++            if (!incoming && system_prompt_cache.enabled() && stages.empty() && req_imgs.empty()) {
++                int64_t sys_turn = -1;   // the last turn boundary (the history's end, as the reader sees it)
++                if (o.turn_token >= 0)
++                    for (int64_t i = n - 1; i > 0; --i)
++                        if (ids[(size_t) i] == o.turn_token) { sys_turn = i; break; }
++                int64_t sys_len = -1;    // the FIRST turn boundary at/after --prompt-cache-root: the end of the system prompt
++                if (sys_turn > 0 && o.prompt_cache_root > 0)
++                    for (int64_t i = 1; i < sys_turn; ++i)
++                        if (ids[(size_t) i] == o.turn_token) { if (i >= o.prompt_cache_root) sys_len = i; break; }
++                if (sys_len > 0) {
++                    const uint64_t key = system_prompt_cache.key_for(ids.data(), (size_t) sys_len, o.system_prompt_cache_key);
++                    strata::core::ConversationPromptMatch hit;
++                    if (!system_prompt_cache.lookup(key, hit)) {
++                        system_prompt_cache.note_miss(key);
++                        if (system_prompt_cache.variants() > 0)
++                            std::fprintf(stderr, "strata serve: system prompt cache: prefix changed (miss, %zu variants live); "
++                                         "reprocessing and rewriting\n", system_prompt_cache.variants());
++                    } else if (hit.tokens <= std::max(resume, std::max(slot_tokens, parked.tokens))) {
++                        system_prompt_cache.note_hit(key, hit.tokens);   // our live state or the RAM cache already reaches it
++                    } else {
++                        constexpr uint64_t admission_extra = 1ull << 20;
++                        const uint64_t estimate = hit.file_bytes > UINT64_MAX - hit.file_bytes / 8 - admission_extra
++                                                      ? UINT64_MAX
++                                                      : hit.file_bytes + hit.file_bytes / 8 + admission_extra;
++                        const uint64_t ram_budget = o.conversation_cache_mib > 0
++                                                        ? (uint64_t) o.conversation_cache_mib * 1024 * 1024 : UINT64_MAX;
++                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                        if (estimate > ram_budget || estimate > SIZE_MAX) {
++                            std::fprintf(stderr, "strata serve: system prompt cache: hit is %llu MiB, over the RAM budget\n",
++                                         (unsigned long long) (estimate >> 20));
++                        } else if (conversations.enabled() && !conversations.make_room((size_t) estimate, 0, spill_evicted)) {
++                            std::fprintf(stderr, "strata serve: system prompt cache: hit does not fit the RAM cache budget\n");
++                        } else if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
++                                       estimate, floor)) {
++                            std::fprintf(stderr, "strata serve: system prompt cache: hit skipped (physical RAM admission)\n");
++                        } else {
++                            strata::core::SessionReadLimits limits;
++                            limits.admit = [floor](uint64_t need, std::string& why) {
++                                const auto avail = strata::core::conversation_available_memory();
++                                if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
++                                why = "not enough RAM to read it";
++                                return false;
++                            };
++                            std::string limits_error;
++                            if (!strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
++                                    (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), limits_error)) {
++                                std::fprintf(stderr, "strata serve: system prompt cache: hit skipped (%s)\n", limits_error.c_str());
++                            } else {
++                                strata::core::SavedConversation restored;
++                                std::string load_error;
++                                if (!system_prompt_cache.load(hit.path, restored, {limits}, load_error)) {
++                                    std::fprintf(stderr, "strata serve: system prompt cache: unreadable variant (%s); "
++                                                 "kept for the GC\n", load_error.c_str());
++                                    system_prompt_cache.note_miss(key);
++                                } else if (!starts_with(restored.live.ids, restored.live.imgs)) {
++                                    // not exactly this prompt's first tokens (hash collision or a changed prompt):
++                                    // NEVER attach a root that is not precisely this prompt's prefix.
++                                    system_prompt_cache.note_miss(key);
++                                } else {
++                                    parked = {0, (int64_t) restored.live.ids.size(), true};
++                                    incoming.emplace(std::move(restored));
++                                    system_prompt_cache.note_hit(key, parked.tokens);
++                                    std::fprintf(stderr, "strata serve: system prompt cache: hit %lld tokens (%zu variants)\n",
++                                                 (long long) parked.tokens, system_prompt_cache.variants());
++                                }
++                            }
++                        }
++                    }
++                }
++            }
+             if (!incoming && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+             if (incoming) slot_source = -1;
+             // Reject the entire image before parking/overwriting the outgoing
+@@ -9155,6 +9341,41 @@ int main(int argc, char** argv) {
+             // Only add a snapshot; the existing token and image checks still decide reuse.
+             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
++            // F5: persist the system-prompt root as a session file the moment it is captured (the session is exactly
++            // at `L` tokens: root_at <= read_from has already been skipped, so at == L when this runs).  It reuses
++            // the existing session-file format through conversation_snapshot_sources, and never rewrites a variant
++            // whose exact prefix is already stored.  CAUSALITY: the artifact holds only the system-prompt prefix's
++            // running state and K/V, keyed by the exact hash of those tokens, so it is only ever the root of a prompt
++            // that begins with them - a different system prompt is a different key and is reprocessed from scratch.
++            auto store_system_prompt_root = [&](int64_t L) {
++                if (!system_prompt_cache.enabled() || L < 1) return;
++                const uint64_t key = system_prompt_cache.key_for(ids.data(), (size_t) L, o.system_prompt_cache_key);
++                strata::core::ConversationPromptMatch stored;
++                if (system_prompt_cache.lookup(key, stored)) return;   // this exact prefix is already persisted
++                try {
++                    std::vector<int32_t> prefix(ids.begin(), ids.begin() + (std::ptrdiff_t) L);
++                    std::vector<ImgKey> imgs = imgs_below(req_imgs, L);
++                    const std::vector<strata::core::ConversationCheckpoint> no_checks;
++                    const strata::core::ConversationView view{prefix, imgs, no_checks, cvec_cached};
++                    std::string e;
++                    strata::core::SavedConversation meta;
++                    std::vector<strata::core::SessionKvSource> sources;
++                    const bool ok = strata::core::conversation_snapshot_sources(meta, sources, view, ss, g,
++                                        mtp.kv_state(), e) &&
++                                    system_prompt_cache.store_streamed(key, meta, sources, e);
++                    if (!ok)
++                        std::fprintf(stderr, "strata serve: system prompt cache: cannot persist the %lld-token root (%s)\n",
++                                     (long long) L, e.c_str());
++                    else
++                        std::fprintf(stderr, "strata serve: system prompt cache: persisted the %lld-token root (%zu variants, "
++                                     "%llu MiB)\n", (long long) L, system_prompt_cache.variants(),
++                                     (unsigned long long) (system_prompt_cache.bytes() >> 20));
++                } catch (const std::bad_alloc&) {
++                    std::fprintf(stderr, "strata serve: system prompt cache: not enough RAM to persist the root\n");
++                } catch (const std::exception& ex) {
++                    std::fprintf(stderr, "strata serve: system prompt cache: %s\n", ex.what());
++                }
++            };
+             int64_t at = read_from;
+             for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
+                 if (to <= at) continue;
+@@ -9198,6 +9419,7 @@ int main(int argc, char** argv) {
+                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                     return 1;
+                 }
++                if (to == root_at) store_system_prompt_root(root_at);   // F5: the same root, made durable
+                 if (trace && to == message_at)
+                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
+                                  (long long) message_at, (long long) (turn_at - message_at));
+@@ -10318,6 +10540,14 @@ int main(int argc, char** argv) {
+                          "disk_evictions=%zu\n", resident, (size_t) (conversation_spill.bytes() >> 20),
+                          conversation_spill.disk_evictions());
+         }
++        if (system_prompt_cache.enabled())   // F5: the system prompt cache's own accounting, at shutdown
++            std::fprintf(stderr, "strata serve: system prompt cache: shutdown: %zu variants, %llu MiB, hits=%llu misses=%llu, "
++                         "tokens_saved=%llu, hash_changes=%llu, evicted_by_space=%zu, evicted_by_age=%zu\n",
++                         system_prompt_cache.variants(), (unsigned long long) (system_prompt_cache.bytes() >> 20),
++                         (unsigned long long) system_prompt_cache.hits(), (unsigned long long) system_prompt_cache.misses(),
++                         (unsigned long long) system_prompt_cache.tokens_saved(),
++                         (unsigned long long) system_prompt_cache.hash_changes(), system_prompt_cache.evicted_by_space(),
++                         system_prompt_cache.evicted_by_age());
+         save_profile("exit");   // #477: QUIT, or the server closed stdin
+         return 0;
+     }
+-- 
+2.53.0.windows.2
+

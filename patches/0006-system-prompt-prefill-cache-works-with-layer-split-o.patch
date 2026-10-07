@@ -1,0 +1,890 @@
+From 10655ecd51c3204d7603b3ca849a407c9eaa1db0 Mon Sep 17 00:00:00 2001
+From: Shahrokh <design@cariblanco.best>
+Date: Tue, 6 Oct 2026 21:45:18 -0600
+Subject: [PATCH 06/10] system-prompt prefill cache works with --layer-split
+ (one session file per stage) and with host-RAM K/V
+
+The F5 gate only enabled the cache with stages.empty() && use_mtp (single GPU). This removes that restriction and makes the variant a per-stage artifact: one byte-for-byte session file per stage plus a joint sidecar (same carve the conversation disk tier writes), so the cache works multi-GPU and under --batch. The sidecar is v2 (stage count + total bytes; v1 still read) with a checksum; the scan never deletes (a broken sidecar, a foreign identity, an orphan file and an incomplete variant are counted and kept), and only the GC removes, oldest first.
+
+load() reads and validates EVERY stage file before replacing the output image, so a missing, foreign or corrupt stage refuses the whole variant with no partial state. The streamed store takes one (K/V-empty meta, sources) pair per stage, stage 0 first, the draft layer's K/V riding with the last stage; every source's read carries its own device because the callbacks run while the file is written.
+
+Host-RAM (streaming) K/V: the source is the authoritative host pool (conversation_cache.hpp), never the replaceable VRAM slots, and the restore path (conversation_snapshot_restore per stage) calls refill_residency, which resets the streaming window (kv_stream_reset) or refills the draft ring (kv_ring_restore) - the PR #1269 lesson, so no stale slots are read after a multi-stage restore.
+
+conversation_snapshot_sources gains the draft==nullptr overload so a stage without the draft's K/V can be captured. conversation_prompt_cache_test: 52 -> 100 checks (2-stage round-trip byte for byte, stage mismatch refused clean, two variants coexisting, host-pool streamed round-trip, inert without flags). conversation_spill_test stays at 102.
+---
+ .../strata/core/conversation_prompt_cache.hpp |  35 ++-
+ include/strata/core/conversation_snapshot.hpp |   6 +
+ src/core/conversation_prompt_cache.cpp        | 215 ++++++++++++++----
+ src/core/conversation_prompt_cache_test.cpp   | 197 ++++++++++++++++
+ src/core/conversation_state.cpp               |  12 +-
+ src/program/generate.cpp                      |  76 +++++--
+ 6 files changed, 469 insertions(+), 72 deletions(-)
+
+diff --git a/include/strata/core/conversation_prompt_cache.hpp b/include/strata/core/conversation_prompt_cache.hpp
+index 24695e9..c8c1fc9 100644
+--- a/include/strata/core/conversation_prompt_cache.hpp
++++ b/include/strata/core/conversation_prompt_cache.hpp
+@@ -1,7 +1,13 @@
+ // The system-prompt prefill cache (--system-prompt-cache): the checkpoint root that ends the system prompt, which
+-// today lives only in RAM (--prompt-cache-root), persisted to disk as an ORDINARY SESSION FILE (conversation_file.cpp
++// today lives only in RAM (--prompt-cache-root), persisted to disk as ORDINARY SESSION FILES (conversation_file.cpp
+ // - the same format, model/config identity and slot save/restore rules; NOT a second format) and reloaded at start.
+ //
++// A layer-split variant (- --layer-split, multigpu) is ONE SESSION FILE PER STAGE plus one joint sidecar, exactly as
++// the conversation disk tier (conversation_spill.hpp) writes a parked conversation: "<key>.sess" is stage 0 (the one
++// the draft layer's K/V travels with when there is a draft), "<key>.stage<k>.sess" the k-th later stage. Each stage
++// file is a byte-for-byte session file of that stage's own carve, so a variant is interchangeable with a hand-saved
++// session of the same stage. A single-GPU variant is the same thing with one stage.
++//
+ // The artifact holds the running state and the K/V of EVERYTHING UP TO AND INCLUDING the end of the system prompt -
+ // never a conversation tail. It is a resume point for a NEW chat whose system prompt is byte-for-byte the stored one:
+ // a prompt that shares it reads only the tokens after it.
+@@ -32,9 +38,10 @@ namespace strata::core {
+ 
+ // A stored variant the caller may load (from the sidecar alone: no K/V read).
+ struct ConversationPromptMatch {
+-    std::string path;        // the session file to read back
+-    uint64_t file_bytes = 0;
++    std::string path;        // stage 0's session file to read back
++    uint64_t file_bytes = 0; // every stage file, summed
+     int64_t tokens = 0;      // the system-prompt prefix length the variant ends at
++    size_t stages = 1;       // session files: stage 0 plus (stages - 1) later stage files
+     explicit operator bool() const { return !path.empty() && tokens > 0; }
+ };
+ 
+@@ -61,12 +68,20 @@ public:
+     void note_hit(uint64_t key, int64_t tokens);
+     void note_miss(uint64_t key);
+ 
+-    // Writes a variant. The two forms write the same file; `store_streamed` avoids a host K/V copy when the engine
++    // Writes a variant. The two forms write the same files; `store_streamed` avoids a host K/V copy when the engine
+     // can stream the K/V (SessionKvSource), `store` takes an already captured image (tests, and the no-draft path).
++    // `store` writes `meta.stage_images` as the later stage files when present (a layer split). The streamed form
++    // takes one meta (K/V empty) + its sources per stage, stage 0 first; every stage writes its own file and the
++    // joint sidecar is committed last, so a failed write leaves no variant behind.
+     bool store_streamed(uint64_t key, const SavedConversation& meta,
+                         const std::vector<SessionKvSource>& sources, std::string& error);
++    bool store_streamed(uint64_t key, const std::vector<SavedConversation>& stage_metas,
++                        const std::vector<std::vector<SessionKvSource>>& stage_sources, std::string& error);
+     bool store(uint64_t key, const SavedConversation& image, std::string& error);
+-    // Reads a variant back with the engine's read limits and identity (the session-file reader).
++    // Reads a variant back with the engine's read limits and identity (the session-file reader). Stage 0 is read
++    // with limits[0], stage k with limits[k] (the last limit bounds every stage past the list, and an empty list
++    // reads with open limits). Every stage file is read and validated BEFORE `image` is replaced: a missing,
++    // foreign or corrupt stage refuses the whole variant and leaves `image` untouched (no partial state).
+     bool load(const std::string& path, SavedConversation& image,
+               const std::vector<SessionReadLimits>& limits, std::string& error) const;
+     bool erase(uint64_t key, std::string& error);
+@@ -89,21 +104,25 @@ private:
+     struct Entry {
+         uint64_t key = 0;
+         int64_t tokens = 0;
+-        uint64_t file_bytes = 0;
+-        std::filesystem::path session;
++        uint64_t file_bytes = 0;   // every stage file, summed
++        size_t stages = 1;         // session files: stage 0 plus (stages - 1) later stage files
++        std::filesystem::path session;   // stage 0's file
+         std::filesystem::path meta;
+         std::filesystem::file_time_type stamp{};
+         uint64_t hits = 0;
++        std::filesystem::path stage_path(size_t k) const;   // k == 0 -> session; else "<stem>.stage<k>.sess"
+     };
+     Entry* find(uint64_t key);
+     const Entry* find(uint64_t key) const;
++    const Entry* find_path(const std::string& path) const;
+     void enforce();
+     bool remove_entry(size_t index);
+     std::filesystem::path variant_file(uint64_t key) const;
++    std::filesystem::path stage_file(uint64_t key, size_t k) const;
+     std::filesystem::path meta_file(uint64_t key) const;
+     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
+     bool write_sidecar(const Entry& entry, std::string& error) const;
+-    bool index_written(uint64_t key, int64_t tokens, uint64_t file_bytes, std::string& error);
++    bool index_written(uint64_t key, int64_t tokens, size_t stages, uint64_t file_bytes, std::string& error);
+ 
+     bool enabled_ = false;
+     SessionFileIdentity identity_{};
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 8a59619..042a31a 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -110,6 +110,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                    const ConversationView& view, const SessionState& session,
+                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
++// The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
++// only).  A layer split's stage 0 and its middle stages park this way; the draft ring is saved once, with the stage
++// that owns it (the last one).  An image is validated and restored with the same kind of call it was saved with.
++bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
++                                   const ConversationView& view, const SessionState& session,
++                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+ bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
+                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+ enum class ConversationRestore { restored, invalid, transfer_failed };
+diff --git a/src/core/conversation_prompt_cache.cpp b/src/core/conversation_prompt_cache.cpp
+index 6731a66..3cde704 100644
+--- a/src/core/conversation_prompt_cache.cpp
++++ b/src/core/conversation_prompt_cache.cpp
+@@ -1,7 +1,8 @@
+-// The system-prompt prefill cache: one ordinary session file per system-prompt prefix (a variant), a small sidecar
+-// beside it holding the key, the prefix length and the file size, so a lookup never reads K/V. The session file is
+-// the same format the slot save/restore API writes, so a variant and a hand-saved session are interchangeable and
+-// the same model/config identity rules refuse a foreign file.
++// The system-prompt prefill cache: one ordinary session file per stage (a layer split) under a single key (a
++// variant), and a small joint sidecar beside them holding the key, the prefix length, the stage count and the total
++// file size, so a lookup never reads K/V. The session files are the same format the slot save/restore API writes, so
++// a stage file and a hand-saved session are interchangeable and the same model/config identity rules refuse a
++// foreign file.
+ //
+ // Causality: the key is the hash of the exact system-prompt token prefix (see the header). A variant is only ever
+ // attached to a prompt that begins with exactly those tokens; a changed system prompt is a different key, so its
+@@ -21,9 +22,13 @@ namespace strata::core {
+ namespace {
+ 
+ constexpr char kMetaMagic[4] = {'S', 'P', 'C', '1'};   // Strata Prompt Cache
+-constexpr uint32_t kMetaVersion = 1;
++constexpr uint32_t kMetaVersion = 2;                   // v2 adds the stage count; v1 (single file) is still read
+ constexpr char kFilePrefix[] = "strata-prompt-";
+-constexpr size_t kMetaBytes = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8;   // magic + version + model + config + key + tokens + file_bytes + digest
++// The fixed sidecar size without the digest, per version: v1 = model+config+key+tokens+file_bytes; v2 = the same
++// plus the stage count. The digest is one more u64.
++constexpr size_t kMetaBytesV1 = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8;   // magic+version+model+config+key+tokens+bytes+digest
++constexpr size_t kMetaBytesV2 = kMetaBytesV1 + 8;
++constexpr uint64_t kMaxStages = 64;                    // a layer split never has more GPUs than this
+ 
+ std::string hex16(uint64_t v) {
+     char buffer[17];
+@@ -33,6 +38,20 @@ std::string hex16(uint64_t v) {
+ 
+ bool is_prompt_name(const std::string& name) { return name.rfind(kFilePrefix, 0) == 0; }
+ 
++// The shared stem of every file of a variant: drop the ".sess" suffix and, when present, a trailing ".stageN".
++std::string stem_string(const std::string& s) {
++    std::string out = s;
++    const std::string ext = ".sess";
++    if (out.size() > ext.size() && out.compare(out.size() - ext.size(), ext.size(), ext) == 0)
++        out.resize(out.size() - ext.size());
++    const size_t at = out.rfind(".stage");
++    if (at != std::string::npos) {
++        const std::string tail = out.substr(at + 6);
++        if (!tail.empty() && tail.find_first_not_of("0123456789") == std::string::npos) out.resize(at);
++    }
++    return out;
++}
++
+ template<class T>
+ void put(std::string& out, T v) { out.append(reinterpret_cast<const char*>(&v), sizeof v); }
+ 
+@@ -49,10 +68,20 @@ std::filesystem::path ConversationPromptCache::variant_file(uint64_t key) const
+     return directory_ / (std::string(kFilePrefix) + hex16(key) + ".sess");
+ }
+ 
++std::filesystem::path ConversationPromptCache::stage_file(uint64_t key, size_t k) const {
++    if (k == 0) return variant_file(key);
++    return directory_ / (std::string(kFilePrefix) + hex16(key) + ".stage" + std::to_string(k) + ".sess");
++}
++
+ std::filesystem::path ConversationPromptCache::meta_file(uint64_t key) const {
+     return directory_ / (std::string(kFilePrefix) + hex16(key) + ".meta");
+ }
+ 
++std::filesystem::path ConversationPromptCache::Entry::stage_path(size_t k) const {
++    if (k == 0) return session;
++    return std::filesystem::path(stem_string(session.string()) + ".stage" + std::to_string(k) + ".sess");
++}
++
+ ConversationPromptCache::Entry* ConversationPromptCache::find(uint64_t key) {
+     for (Entry& e : entries_) if (e.key == key) return &e;
+     return nullptr;
+@@ -63,42 +92,51 @@ const ConversationPromptCache::Entry* ConversationPromptCache::find(uint64_t key
+     return nullptr;
+ }
+ 
++const ConversationPromptCache::Entry* ConversationPromptCache::find_path(const std::string& path) const {
++    for (const Entry& e : entries_) if (e.session.string() == path) return &e;
++    return nullptr;
++}
++
+ bool ConversationPromptCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
+                                            std::string& error) const {
+     other_identity = false;
+     std::error_code ec;
+     const uint64_t file_bytes = std::filesystem::file_size(meta, ec);
+-    if (ec || file_bytes < kMetaBytes) { error = "prompt cache sidecar is missing or too short"; return false; }
++    if (ec || file_bytes < kMetaBytesV1) { error = "prompt cache sidecar is missing or too short"; return false; }
+     std::ifstream in(meta, std::ios::binary);
+     if (!in) { error = "cannot open prompt cache sidecar"; return false; }
+-    std::string raw(kMetaBytes, '\0');
++    std::string raw((size_t) std::min<uint64_t>(file_bytes, kMetaBytesV2), '\0');
+     in.read(raw.data(), (std::streamsize) raw.size());
+     if (!in || in.gcount() != (std::streamsize) raw.size()) { error = "truncated prompt cache sidecar"; return false; }
+     size_t at = 0;
+     auto take = [&](void* p, size_t n) { std::memcpy(p, raw.data() + at, n); at += n; };
+     char magic[4];
+     uint32_t version = 0;
+-    uint64_t model = 0, config = 0, key = 0, stored_bytes = 0, digest = 0;
+-    int64_t tokens = 0;
+-    take(magic, 4); take(&version, 4); take(&model, 8); take(&config, 8); take(&key, 8); take(&tokens, 8);
+-    take(&stored_bytes, 8); take(&digest, 8);
+-    if (std::memcmp(magic, kMetaMagic, 4) != 0 || version != kMetaVersion) {
++    take(magic, 4); take(&version, 4);
++    if (std::memcmp(magic, kMetaMagic, 4) != 0 || (version != 1 && version != kMetaVersion)) {
+         error = "unknown prompt cache sidecar magic or version"; return false;
+     }
++    uint64_t model = 0, config = 0, key = 0, stored_bytes = 0, digest = 0, stages = 1;
++    int64_t tokens = 0;
++    take(&model, 8); take(&config, 8); take(&key, 8); take(&tokens, 8); take(&stored_bytes, 8);
++    if (version >= 2) take(&stages, 8);
++    take(&digest, 8);
+     SessionHasher h(0);
+     h.update(raw.data(), at - 8);
+     if (h.digest() != digest) { error = "prompt cache sidecar checksum mismatch"; return false; }
+     if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
+     if (tokens <= 0) { error = "invalid prompt cache token count"; return false; }
++    if (stages < 1 || stages > kMaxStages) { error = "invalid prompt cache stage count"; return false; }
+     entry.key = key;
+     entry.tokens = tokens;
+-    entry.file_bytes = stored_bytes;
++    entry.stages = (size_t) stages;
++    entry.file_bytes = stored_bytes;   // advisory: the scan re-sums the actual files
+     return true;
+ }
+ 
+ bool ConversationPromptCache::write_sidecar(const Entry& entry, std::string& error) const {
+     std::string raw;
+-    raw.reserve(kMetaBytes);
++    raw.reserve(kMetaBytesV2);
+     raw.append(kMetaMagic, 4);
+     put(raw, (uint32_t) kMetaVersion);
+     put(raw, (uint64_t) identity_.model);
+@@ -106,6 +144,7 @@ bool ConversationPromptCache::write_sidecar(const Entry& entry, std::string& err
+     put(raw, (uint64_t) entry.key);
+     put(raw, (int64_t) entry.tokens);
+     put(raw, (uint64_t) entry.file_bytes);
++    put(raw, (uint64_t) entry.stages);
+     put_digest(raw);
+     const std::filesystem::path temporary(entry.meta.string() + ".tmp");
+     {
+@@ -170,18 +209,27 @@ bool ConversationPromptCache::open(const std::filesystem::path& directory, Sessi
+             entry.session = variant_file(entry.key);
+             std::error_code sec;
+             const uint64_t session_bytes = std::filesystem::file_size(entry.session, sec);
+-            if (sec || session_bytes == 0) { ++stale_files_kept_; continue; }   // session gone: the sidecar is useless, kept
+-            entry.file_bytes = session_bytes;
++            if (sec || session_bytes == 0) { ++stale_files_kept_; continue; }   // first file gone: the sidecar is useless, kept
++            uint64_t total = session_bytes;
++            bool complete = true;
++            for (size_t k = 1; k < entry.stages; ++k) {
++                std::error_code kec;
++                const uint64_t part = std::filesystem::file_size(stage_file(entry.key, k), kec);
++                if (kec || part == 0) { complete = false; break; }   // a missing stage file: the variant is incomplete
++                total += part;
++            }
++            if (!complete) { ++stale_files_kept_; continue; }   // kept, never removed: a later write may complete it
++            entry.file_bytes = total;
+             entry.stamp = std::filesystem::last_write_time(entry.session, sec);
+             if (sec) entry.stamp = {};
+-            if (budget_ && session_bytes > budget_) ++oversized_files_kept_;   // KEPT: the GC leaves it alone too
++            if (budget_ && total > budget_) ++oversized_files_kept_;   // KEPT: the GC leaves it alone too
+             entries_.push_back(std::move(entry));
+-            bytes_ += session_bytes;
++            bytes_ += total;
+         }
+-        // A session file with no sidecar left behind (a crash between the two writes) would never be matched.
++        // A session file (of any stage) with no sidecar left behind (a crash between the writes) would never be
++        // matched: report it, do not delete it.
+         for (const auto& path : session_files) {
+-            std::filesystem::path meta = path;
+-            meta.replace_extension(".meta");
++            const std::filesystem::path meta = stem_string(path.string()) + ".meta";
+             if (!std::filesystem::exists(meta, ec) && !ec) ++orphan_files_kept_;
+             ec.clear();
+         }
+@@ -215,6 +263,7 @@ bool ConversationPromptCache::lookup(uint64_t key, ConversationPromptMatch& out)
+     out.path = entry->session.string();
+     out.file_bytes = entry->file_bytes;
+     out.tokens = entry->tokens;
++    out.stages = entry->stages;
+     return true;
+ }
+ 
+@@ -241,33 +290,39 @@ bool ConversationPromptCache::erase(uint64_t key, std::string& error) {
+     return true;
+ }
+ 
+-bool ConversationPromptCache::index_written(uint64_t key, int64_t tokens, uint64_t file_bytes, std::string& error) {
++bool ConversationPromptCache::index_written(uint64_t key, int64_t tokens, size_t stages, uint64_t file_bytes,
++                                            std::string& error) {
+     std::error_code ec;
+     const std::filesystem::path session = variant_file(key);
+     Entry entry;
+     entry.key = key;
+     entry.tokens = tokens;
++    entry.stages = stages;
+     entry.file_bytes = file_bytes;
+     entry.session = session;
+     entry.meta = meta_file(key);
+     entry.stamp = std::filesystem::last_write_time(session, ec);
+     if (ec) entry.stamp = {};
+     if (!write_sidecar(entry, error)) return false;
+-    const bool known = find(key) != nullptr;
+-    if (!known) {
++    Entry* existing = find(key);
++    if (existing == nullptr) {
+         // A new key beside a stored variant: the system prompt changed (or a second one is in use). Counted.
+         if (!entries_.empty()) ++hash_changes_;
+         try {
+             entries_.push_back(std::move(entry));
+         } catch (const std::bad_alloc&) {
+             std::error_code rec;
+-            std::filesystem::remove(session, rec);
++            for (size_t k = 0; k < stages; ++k) std::filesystem::remove(stage_file(key, k), rec);
+             std::filesystem::remove(meta_file(key), rec);
+             error = "not enough RAM to index the prompt cache variant"; return false;
+         }
+         bytes_ += file_bytes;
+     } else {
+-        Entry* existing = find(key);
++        // The same key rewritten (a crash between writes, or a re-store): drop the stage files it no longer has.
++        for (size_t k = stages; k < existing->stages; ++k) {
++            std::error_code rec;
++            std::filesystem::remove(stage_file(key, k), rec);
++        }
+         bytes_ -= existing->file_bytes;
+         *existing = std::move(entry);
+         bytes_ += file_bytes;
+@@ -279,33 +334,105 @@ bool ConversationPromptCache::index_written(uint64_t key, int64_t tokens, uint64
+ 
+ bool ConversationPromptCache::store(uint64_t key, const SavedConversation& image, std::string& error) {
+     if (!enabled_) return false;
+-    const std::filesystem::path session = variant_file(key);
+-    size_t bytes = 0;
+-    SessionWriteOptions wo;
+-    wo.durable = true;
+-    SessionStatus st;
+-    if (!session_file_write(session.string(), image, identity_, bytes, error, wo, &st)) return false;
+-    return index_written(key, (int64_t) image.live.ids.size(), bytes, error);
++    std::vector<std::string> written;
++    auto discard = [&] {
++        std::error_code rec;
++        for (const std::string& f : written) std::filesystem::remove(f, rec);
++        written.clear();
++    };
++    auto write = [&](const std::filesystem::path& path, const SavedConversation& part, uint64_t& total) -> bool {
++        size_t bytes = 0;
++        SessionWriteOptions wo;
++        wo.durable = true;
++        SessionStatus st;
++        if (!session_file_write(path.string(), part, identity_, bytes, error, wo, &st)) return false;
++        total += bytes;
++        written.push_back(path.string());
++        return true;
++    };
++    uint64_t total = 0;
++    if (!write(stage_file(key, 0), image, total)) { discard(); return false; }
++    for (size_t k = 0; k < image.stage_images.size(); ++k)
++        if (!write(stage_file(key, k + 1), image.stage_images[k], total)) { discard(); return false; }
++    if (!index_written(key, (int64_t) image.live.ids.size(), 1 + image.stage_images.size(), total, error)) {
++        discard();
++        return false;
++    }
++    return true;
+ }
+ 
+ bool ConversationPromptCache::store_streamed(uint64_t key, const SavedConversation& meta,
+                                              const std::vector<SessionKvSource>& sources, std::string& error) {
++    std::vector<SavedConversation> metas;
++    std::vector<std::vector<SessionKvSource>> stage_sources;
++    metas.push_back(meta);
++    stage_sources.push_back(sources);
++    return store_streamed(key, metas, stage_sources, error);
++}
++
++bool ConversationPromptCache::store_streamed(uint64_t key, const std::vector<SavedConversation>& stage_metas,
++                                             const std::vector<std::vector<SessionKvSource>>& stage_sources,
++                                             std::string& error) {
+     if (!enabled_) return false;
+-    const std::filesystem::path session = variant_file(key);
+-    size_t bytes = 0;
+-    SessionWriteOptions wo;
+-    wo.durable = true;
+-    SessionStatus st;
+-    if (!session_file_write(session.string(), meta, sources, identity_, bytes, error, wo, &st)) return false;
+-    return index_written(key, (int64_t) meta.live.ids.size(), bytes, error);
++    if (stage_metas.empty() || stage_metas.size() != stage_sources.size()) {
++        error = "prompt cache store needs one meta and its sources per stage"; return false;
++    }
++    std::vector<std::string> written;
++    auto discard = [&] {
++        std::error_code rec;
++        for (const std::string& f : written) std::filesystem::remove(f, rec);
++        written.clear();
++    };
++    uint64_t total = 0;
++    for (size_t k = 0; k < stage_metas.size(); ++k) {
++        const std::filesystem::path path = stage_file(key, k);
++        size_t bytes = 0;
++        SessionWriteOptions wo;
++        wo.durable = true;
++        SessionStatus st;
++        if (!session_file_write(path.string(), stage_metas[k], stage_sources[k], identity_, bytes, error, wo, &st)) {
++            discard();
++            return false;
++        }
++        total += bytes;
++        written.push_back(path.string());
++    }
++    // The sidecar is committed LAST: until it is there the variant does not exist, so a crash between the writes
++    // leaves orphan session files (reported, never matched) rather than a half variant.
++    if (!index_written(key, (int64_t) stage_metas[0].live.ids.size(), stage_metas.size(), total, error)) {
++        discard();
++        return false;
++    }
++    return true;
+ }
+ 
+ bool ConversationPromptCache::load(const std::string& path, SavedConversation& image,
+                                    const std::vector<SessionReadLimits>& limits, std::string& error) const {
+     if (!enabled_) { error = "prompt cache is disabled"; return false; }
++    const Entry* entry = find_path(path);
++    const size_t stages = entry != nullptr ? entry->stages : 1;
++    const SessionReadLimits open_limits;
++    auto for_stage = [&](size_t i) -> const SessionReadLimits& {
++        if (limits.empty()) return open_limits;
++        return limits[i < limits.size() ? i : limits.size() - 1];
++    };
++    // Every stage file is read and validated into a LOCAL image first; `image` is replaced only once all of them
++    // read. A missing, foreign or corrupt stage therefore refuses the whole variant with no partial state applied.
++    SavedConversation main;
+     size_t bytes = 0;
+-    if (limits.empty()) return session_file_read(path, identity_, image, bytes, error);
+-    return session_file_read(path, identity_, image, bytes, error, limits[0]);
++    if (!session_file_read(path, identity_, main, bytes, error, for_stage(0))) return false;
++    std::vector<SavedConversation> stage_images;
++    stage_images.reserve(stages > 1 ? stages - 1 : 0);
++    for (size_t k = 1; k < stages; ++k) {
++        SavedConversation part;
++        size_t part_bytes = 0;
++        const std::string file = entry->stage_path(k).string();
++        if (!session_file_read(file, identity_, part, part_bytes, error, for_stage(k))) return false;
++        stage_images.push_back(std::move(part));
++    }
++    main.stage_images = std::move(stage_images);
++    image = std::move(main);
++    return true;
+ }
+ 
+ bool ConversationPromptCache::remove_entry(size_t index) {
+@@ -314,6 +441,8 @@ bool ConversationPromptCache::remove_entry(size_t index) {
+     const bool removed = std::filesystem::remove(entry.session, ec);
+     ec.clear();
+     if (!removed && std::filesystem::exists(entry.session)) return false;
++    for (size_t k = 1; k < entry.stages; ++k) std::filesystem::remove(entry.stage_path(k), ec);
++    ec.clear();
+     std::filesystem::remove(entry.meta, ec);
+     bytes_ -= entry.file_bytes;
+     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
+diff --git a/src/core/conversation_prompt_cache_test.cpp b/src/core/conversation_prompt_cache_test.cpp
+index 2f297e6..37dcace 100644
+--- a/src/core/conversation_prompt_cache_test.cpp
++++ b/src/core/conversation_prompt_cache_test.cpp
+@@ -7,7 +7,10 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <filesystem>
++#include <fstream>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -61,12 +64,70 @@ SavedConversation sample(size_t tokens) {
+     }
+     return s;
+ }
++// The same image without its K/V (the streamed form: the K/V comes from per-stage sources).
++SavedConversation sample_meta(size_t tokens) {
++    SavedConversation s = sample(tokens);
++    s.kv.clear();
++    return s;
++}
++// A layer-split image: stage 0 (layers [0,24)) plus one later stage (layers [24,48)) with visibly different K/V.
++SavedConversation two_stage(size_t tokens) {
++    SavedConversation s = sample(tokens);
++    s.layer_lo = 0; s.layer_hi = 24;
++    SavedConversation stage = sample(tokens);
++    stage.layer_lo = 24; stage.layer_hi = 48;
++    stage.kv.clear();
++    for (int layer = 0; layer < 2; ++layer) {
++        ConversationKv kv;
++        kv.format = 5 + layer; kv.cells = 1024; kv.heads = 2; kv.head_dim = 256;
++        kv.page_size = 64; kv.pooled_rows = 9; kv.idx_dim = 128;
++        kv.k = pattern(2048, uint8_t(layer + 100)); kv.v = pattern(2048 + layer, uint8_t(layer + 110));
++        kv.k_scale = pattern(256, uint8_t(layer + 120)); kv.v_scale = pattern(256, uint8_t(layer + 130));
++        kv.pooled = pattern(9 * 128 * 4, uint8_t(layer + 140));
++        stage.kv.push_back(std::move(kv));
++    }
++    s.stage_images.push_back(std::move(stage));
++    return s;
++}
++bool kv_equal(const ConversationKv& a, const ConversationKv& b) {
++    return a.format == b.format && a.cells == b.cells && a.heads == b.heads && a.head_dim == b.head_dim &&
++           a.page_size == b.page_size && a.pooled_rows == b.pooled_rows && a.idx_dim == b.idx_dim &&
++           a.k == b.k && a.v == b.v && a.k_scale == b.k_scale && a.v_scale == b.v_scale && a.pooled == b.pooled;
++}
++bool image_equal(const SavedConversation& a, const SavedConversation& b) {
++    if (a.live.ids != b.live.ids || a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi ||
++        a.cvec != b.cvec || a.kv.size() != b.kv.size() || a.stage_images.size() != b.stage_images.size()) return false;
++    for (size_t i = 0; i < a.kv.size(); ++i) if (!kv_equal(a.kv[i], b.kv[i])) return false;
++    for (size_t i = 0; i < a.stage_images.size(); ++i) if (!image_equal(a.stage_images[i], b.stage_images[i])) return false;
++    return true;
++}
++// A streamed K/V source over a whole in-RAM part table: what a --kv-resident layer's authoritative host pool exposes.
++SessionKvSource stream_source(int format, const std::vector<std::vector<uint8_t>>& parts) {
++    SessionKvSource s;
++    s.format = format; s.cells = 1024; s.heads = 2; s.head_dim = 256; s.page_size = 64; s.pooled_rows = 9;
++    s.idx_dim = 128;
++    for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i].size();
++    auto table = std::make_shared<std::vector<std::vector<uint8_t>>>(parts);
++    s.read = [table](size_t part, size_t offset, void* dst, size_t n) -> bool {
++        if (part >= 5 || offset > (*table)[part].size() || n > (*table)[part].size() - offset) return false;
++        std::memcpy(dst, (*table)[part].data() + offset, n);
++        return true;
++    };
++    s.error = [] { return std::string(); };
++    return s;
++}
+ size_t count_sess(const fs::path& dir) {
+     size_t n = 0;
+     for (const auto& e : fs::directory_iterator(dir))
+         if (e.path().extension() == ".sess") ++n;
+     return n;
+ }
++// The stage-1 file beside stage 0's ("<stem>.sess" -> "<stem>.stage1.sess").
++fs::path stage1_of(const std::string& stage0) {
++    std::string s = stage0;
++    if (s.size() > 5 && s.compare(s.size() - 5, 5, ".sess") == 0) s.resize(s.size() - 5);
++    return fs::path(s + ".stage1.sess");
++}
+ } // namespace
+ 
+ int main() {
+@@ -83,6 +144,7 @@ int main() {
+     check(!off.lookup(123, match), "closed cache has no lookup");
+     SavedConversation first = sample(1000);
+     check(!off.store(123, first, error), "closed cache refuses a store");
++    check(!off.store_streamed(123, first, {}, error), "closed cache refuses a streamed store");
+     check(!fs::exists(dir), "closed cache wrote nothing to disk");
+ 
+     // ---- open, store a variant, hit it ----
+@@ -180,6 +242,141 @@ int main() {
+     check(tiny_again.variants() == 1, "the oversized variant survives a reopen");
+     check(tiny_again.oversized_files_kept() >= 1, "reported oversized on reopen");
+ 
++    // ================= a layer split: one session file per stage + one joint sidecar =================
++    // (a) a two-stage variant round-trips byte for byte through store() (host image)
++    {
++        const fs::path mdir = dir.string() + "-stages";
++        fs::remove_all(mdir);
++        ConversationPromptCache mc;
++        check(mc.open(mdir, id, 1ull << 30, 8, 0, error), "stages: open");
++        SavedConversation ts = two_stage(1000);
++        std::vector<int64_t> pre(ts.live.ids.begin(), ts.live.ids.end());
++        const uint64_t mk = mc.key_for(pre.data(), pre.size(), "");
++        check(mc.store(mk, ts, error), "stages: store a two-stage variant");
++        check(mc.variants() == 1, "stages: one variant");
++        check(count_sess(mdir) == 2, "stages: two session files on disk");
++        ConversationPromptMatch smatch;
++        check(mc.lookup(mk, smatch) && smatch.stages == 2, "stages: the sidecar says two stages");
++        check(fs::exists(stage1_of(smatch.path)), "stages: stage 1 file exists");
++        SavedConversation back;
++        check(mc.load(smatch.path, back, {}, error), "stages: load the two-stage variant");
++        check(back.stage_images.size() == 1, "stages: one later-stage image read back");
++        check(image_equal(back, ts), "stages: two stages round-trip byte for byte");
++        // a restart still reads both files
++        ConversationPromptCache mc2;
++        check(mc2.open(mdir, id, 1ull << 30, 8, 0, error), "stages: reopen");
++        check(mc2.lookup(mk, smatch) && smatch.stages == 2, "stages: two stages after a reopen");
++        SavedConversation back2;
++        check(mc2.load(smatch.path, back2, {}, error) && image_equal(back2, ts), "stages: byte-for-byte after a reopen");
++        fs::remove_all(mdir);
++    }
++
++    // (b) a stage mismatch is refused clean, before anything is applied to the caller's image
++    {
++        const fs::path mdir = dir.string() + "-mismatch";
++        fs::remove_all(mdir);
++        ConversationPromptCache mc;
++        check(mc.open(mdir, id, 1ull << 30, 8, 0, error), "mismatch: open");
++        SavedConversation ts = two_stage(1000);
++        std::vector<int64_t> pre(ts.live.ids.begin(), ts.live.ids.end());
++        const uint64_t mk = mc.key_for(pre.data(), pre.size(), "");
++        check(mc.store(mk, ts, error), "mismatch: store a two-stage variant");
++        ConversationPromptMatch mmatch;
++        check(mc.lookup(mk, mmatch) && mmatch.stages == 2, "mismatch: two stages");
++        // a stage file of ANOTHER identity: the session reader's model/config check refuses it
++        const fs::path fdir = dir.string() + "-foreignstage";
++        fs::remove_all(fdir);
++        ConversationPromptCache fc;
++        check(fc.open(fdir, SessionFileIdentity{9, 9}, 1ull << 30, 8, 0, error), "mismatch: open the foreign cache");
++        SavedConversation fs1 = sample(400);
++        std::vector<int64_t> fpre(fs1.live.ids.begin(), fs1.live.ids.end());
++        const uint64_t fk = fc.key_for(fpre.data(), fpre.size(), "");
++        check(fc.store(fk, fs1, error), "mismatch: store a foreign-identity session");
++        ConversationPromptMatch fmatch;
++        check(fc.lookup(fk, fmatch), "mismatch: the foreign variant is present");
++        fs::copy_file(fmatch.path, stage1_of(mmatch.path), fs::copy_options::overwrite_existing);
++        SavedConversation out_img;
++        out_img.live.ids = {7, 7, 7};
++        std::string load_error;
++        check(!mc.load(mmatch.path, out_img, {}, load_error), "mismatch: a foreign-identity stage is refused");
++        check(out_img.live.ids == std::vector<int32_t>{7, 7, 7}, "mismatch: nothing was applied to the output image");
++        check(mc.lookup(mk, mmatch), "mismatch: the variant is kept (never deleted) until the GC");
++        // restore the real stage 1, then truncate it: a torn stage is refused too, still cleanly
++        check(mc.store(mk, ts, error), "mismatch: re-store the valid two-stage variant");
++        {
++            std::ofstream out(stage1_of(mmatch.path), std::ios::binary | std::ios::trunc);
++            out << "broken";
++        }
++        out_img.live.ids = {8, 8, 8};
++        check(!mc.load(mmatch.path, out_img, {}, load_error), "mismatch: a truncated stage is refused");
++        check(out_img.live.ids == std::vector<int32_t>{8, 8, 8}, "mismatch: still nothing applied");
++        fs::remove_all(mdir);
++        fs::remove_all(fdir);
++    }
++
++    // (c) a single-stage and a two-stage variant coexist, each loads with its own stage count
++    {
++        const fs::path cdir = dir.string() + "-coexist";
++        fs::remove_all(cdir);
++        ConversationPromptCache cc;
++        check(cc.open(cdir, id, 1ull << 30, 8, 0, error), "coexist: open");
++        SavedConversation s1 = sample(1000);
++        SavedConversation s2 = two_stage(1200);
++        std::vector<int64_t> p1(s1.live.ids.begin(), s1.live.ids.end());
++        std::vector<int64_t> p2(s2.live.ids.begin(), s2.live.ids.end());
++        const uint64_t kA = cc.key_for(p1.data(), p1.size(), "");
++        const uint64_t kB = cc.key_for(p2.data(), p2.size(), "");
++        check(cc.store(kA, s1, error), "coexist: store the single-stage variant");
++        check(cc.store(kB, s2, error), "coexist: store the two-stage variant beside it");
++        check(cc.variants() == 2, "coexist: both variants live");
++        ConversationPromptMatch ma, mb;
++        check(cc.lookup(kA, ma) && ma.stages == 1, "coexist: the single-stage variant has one stage");
++        check(cc.lookup(kB, mb) && mb.stages == 2, "coexist: the two-stage variant has two");
++        SavedConversation ba, bb;
++        check(cc.load(ma.path, ba, {}, error) && ba.stage_images.empty(), "coexist: the single-stage variant loads single");
++        check(cc.load(mb.path, bb, {}, error) && bb.stage_images.size() == 1, "coexist: the two-stage variant loads both");
++        check(image_equal(bb, s2), "coexist: the two-stage variant round-trips whole");
++        check(cc.hash_changes() == 1, "coexist: the second prefix counts as a hash change");
++        fs::remove_all(cdir);
++    }
++
++    // (d) the streamed form: K/V read from a per-stage host pool (--kv-resident), no host image capture
++    {
++        const fs::path sdir = dir.string() + "-streamed";
++        fs::remove_all(sdir);
++        ConversationPromptCache sc;
++        check(sc.open(sdir, id, 1ull << 30, 8, 0, error), "streamed: open");
++        const std::vector<std::vector<uint8_t>> lb0 = {bytes_of(4096, 1), bytes_of(4096, 2), bytes_of(512, 3),
++                                                       bytes_of(512, 4), bytes_of(9 * 128 * 4, 5)};
++        const std::vector<std::vector<uint8_t>> lb1 = {bytes_of(2048, 11), bytes_of(2048, 12), bytes_of(256, 13),
++                                                       bytes_of(256, 14), bytes_of(9 * 128 * 4, 15)};
++        SavedConversation m0 = sample_meta(1000);
++        SavedConversation m1 = sample_meta(1000);
++        m1.layer_lo = 24; m1.layer_hi = 48;
++        std::vector<std::vector<SessionKvSource>> sources(2);
++        sources[0].push_back(stream_source(2, lb0));
++        sources[1].push_back(stream_source(5, lb1));
++        std::vector<int64_t> pre(m0.live.ids.begin(), m0.live.ids.end());
++        const uint64_t sk = sc.key_for(pre.data(), pre.size(), "");
++        check(sc.store_streamed(sk, {m0, m1}, sources, error), "streamed: store two stages from their sources");
++        check(sc.variants() == 1, "streamed: one variant");
++        check(count_sess(sdir) == 2, "streamed: two session files on disk");
++        ConversationPromptMatch smatch;
++        check(sc.lookup(sk, smatch) && smatch.stages == 2, "streamed: two stages");
++        SavedConversation back;
++        check(sc.load(smatch.path, back, {}, error), "streamed: load");
++        check(back.stage_images.size() == 1, "streamed: one later-stage image");
++        check(back.live.ids == m0.live.ids, "streamed: ids round-trip");
++        check(back.kv.size() == 1 && back.stage_images[0].kv.size() == 1, "streamed: one K/V layer per stage");
++        std::vector<uint8_t> k0(4096);
++        check(back.kv[0].k.read(k0.data(), 0, k0.size()), "streamed: read stage 0 K back");
++        check(k0 == lb0[0], "streamed: stage 0's K round-trips byte for byte");
++        std::vector<uint8_t> p1(9 * 128 * 4);
++        check(back.stage_images[0].kv[0].pooled.read(p1.data(), 0, p1.size()), "streamed: read stage 1 pooled back");
++        check(p1 == lb1[4], "streamed: stage 1's pooled row round-trips byte for byte");
++        fs::remove_all(sdir);
++    }
++
+     fs::remove_all(dir);
+     fs::remove_all(tiny_dir);
+     std::printf("conversation_prompt_cache_test: %d checks passed\n", checks);
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index 4c77465..ca6189a 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -275,7 +275,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+ 
+ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+-                                   const QsaState& draft, std::string& error) {
++                                   const QsaState* draft, std::string& error) {
+     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+     SavedConversation captured;
+     captured.geometry = geometry_key(g);
+@@ -285,15 +285,21 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
+     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+     const int64_t upto = (int64_t) view.ids.size();
+     const size_t layers = owned_qsa(ss);
+-    std::vector<SessionKvSource> out(layers + 1);
++    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
+     for (size_t j = 0; j < layers; ++j)
+         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
++    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
+     meta = std::move(captured);
+     sources = std::move(out);
+     return true;
+ }
+ 
++bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
++                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
++                                   const QsaState& draft, std::string& error) {
++    return conversation_snapshot_sources(meta, sources, view, ss, g, &draft, error);
++}
++
+ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
+                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                       std::string& error) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 0961b1a..e0880b6 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -6521,16 +6521,17 @@ int main(int argc, char** argv) {
+             }
+         }
+         // The system-prompt prefill cache (F5): the checkpoint root that ends the system prompt (--prompt-cache-root)
+-        // persisted as an ordinary session file and reloaded at start, so a NEW chat of the same client reads only
++        // persisted as ordinary session files and reloaded at start, so a NEW chat of the same client reads only
+         // the tokens after it.  Its own directory, its own budget, its own variant count.  Off unless
+-        // --system-prompt-cache; single-session only (no layer split), because the artifact is one session file of
+-        // this engine's own carve.
++        // --system-prompt-cache.  With a layer split the variant is one session file per stage plus one joint
++        // sidecar (the same carve the disk tier writes, conversation_spill.hpp), so it works multi-GPU - and under
++        // --batch - exactly as it does single-GPU.
+         // A session with the draft layer (--mtp) only: the disk save streams the K/V (conversation_snapshot_sources),
+         // which needs the draft's own K/V to be part of the artifact, and the restore path checks for it. Without
+         // --mtp the feature stays off (reported) rather than capturing a different artifact.
+         strata::core::ConversationPromptCache system_prompt_cache;
+         strata::core::SessionFileIdentity system_prompt_identity;
+-        if (o.serve && o.system_prompt_cache && !o.system_prompt_cache_dir.empty() && stages.empty() && use_mtp) {
++        if (o.serve && o.system_prompt_cache && !o.system_prompt_cache_dir.empty() && use_mtp) {
+             std::string identity_error;
+             if (!session_identity(system_prompt_identity, identity_error, nullptr)) {
+                 std::fprintf(stderr, "strata serve: system prompt cache: disabled (%s)\n", identity_error.c_str());
+@@ -8582,7 +8583,7 @@ int main(int argc, char** argv) {
+             // loaded root is checked to be exactly this prompt's first tokens before it is used, so a stored tail K/V
+             // can never ride behind a different system prompt. A changed system prompt is a different key: it misses,
+             // is reprocessed from the start and is stored as its own variant (the old one is kept for the GC).
+-            if (!incoming && system_prompt_cache.enabled() && stages.empty() && req_imgs.empty()) {
++            if (!incoming && system_prompt_cache.enabled() && req_imgs.empty()) {
+                 int64_t sys_turn = -1;   // the last turn boundary (the history's end, as the reader sees it)
+                 if (o.turn_token >= 0)
+                     for (int64_t i = n - 1; i > 0; --i)
+@@ -8618,27 +8619,40 @@ int main(int argc, char** argv) {
+                                        estimate, floor)) {
+                             std::fprintf(stderr, "strata serve: system prompt cache: hit skipped (physical RAM admission)\n");
+                         } else {
+-                            strata::core::SessionReadLimits limits;
+-                            limits.admit = [floor](uint64_t need, std::string& why) {
++                            // One read limit per stage file (conversation_prompt_cache.hpp): the main image's carve,
++                            // then each later stage's.  A layer split's variant is one session file per stage, so
++                            // every file is bounded by the stage it restores into before it is read.
++                            std::vector<strata::core::SessionReadLimits> limits(1 + stages.size());
++                            for (auto& l : limits) l.admit = [floor](uint64_t need, std::string& why) {
+                                 const auto avail = strata::core::conversation_available_memory();
+                                 if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                                 why = "not enough RAM to read it";
+                                 return false;
+                             };
+                             std::string limits_error;
+-                            if (!strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
+-                                    (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), limits_error)) {
++                            bool limits_ok = strata::core::conversation_session_read_limits(
++                                    limits[0], ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                                    (uint64_t) std::max(o.prompt_cache, 1), limits_error);
++                            for (size_t i = 0; limits_ok && i < stages.size(); ++i)
++                                limits_ok = strata::core::conversation_session_read_limits(
++                                        limits[i + 1], stages[i]->ss, g, mtp.kv_state(), (uint64_t) o.max_context,
++                                        (uint64_t) std::max(o.prompt_cache, 1), limits_error);
++                            if (!limits_ok) {
+                                 std::fprintf(stderr, "strata serve: system prompt cache: hit skipped (%s)\n", limits_error.c_str());
+                             } else {
+                                 strata::core::SavedConversation restored;
+                                 std::string load_error;
+-                                if (!system_prompt_cache.load(hit.path, restored, {limits}, load_error)) {
++                                // load() reads and validates every stage file before it hands `restored` back: a
++                                // missing, foreign or corrupt stage refuses the whole variant with no partial state.
++                                if (!system_prompt_cache.load(hit.path, restored, limits, load_error)) {
+                                     std::fprintf(stderr, "strata serve: system prompt cache: unreadable variant (%s); "
+                                                  "kept for the GC\n", load_error.c_str());
+                                     system_prompt_cache.note_miss(key);
+-                                } else if (!starts_with(restored.live.ids, restored.live.imgs)) {
+-                                    // not exactly this prompt's first tokens (hash collision or a changed prompt):
+-                                    // NEVER attach a root that is not precisely this prompt's prefix.
++                                } else if (!starts_with(restored.live.ids, restored.live.imgs) ||
++                                           restored.stage_images.size() != stages.size()) {
++                                    // not exactly this prompt's first tokens (hash collision or a changed prompt),
++                                    // or a variant of another split: NEVER attach a root that is not precisely this
++                                    // prompt's prefix for this engine's own carve.
+                                     system_prompt_cache.note_miss(key);
+                                 } else {
+                                     parked = {0, (int64_t) restored.live.ids.size(), true};
+@@ -9357,12 +9371,38 @@ int main(int argc, char** argv) {
+                     std::vector<ImgKey> imgs = imgs_below(req_imgs, L);
+                     const std::vector<strata::core::ConversationCheckpoint> no_checks;
+                     const strata::core::ConversationView view{prefix, imgs, no_checks, cvec_cached};
++                    // One (K/V-empty meta, sources) pair per stage, stage 0 first: the draft layer's K/V rides with
++                    // the last stage (as the parking capture does, draft_of) and the earlier stages hold none.  The
++                    // sources' read callbacks run while each file is written, so every source carries its own device:
++                    // the K/V of a stage whose host pool is authoritative (--kv-resident) still reads from that
++                    // stage, and a stage that keeps its K/V in VRAM is read on its own GPU.
++                    const size_t n_st = stages.size();
++                    std::vector<strata::core::SavedConversation> stage_metas(1 + n_st);
++                    std::vector<std::vector<strata::core::SessionKvSource>> stage_sources(1 + n_st);
+                     std::string e;
+-                    strata::core::SavedConversation meta;
+-                    std::vector<strata::core::SessionKvSource> sources;
+-                    const bool ok = strata::core::conversation_snapshot_sources(meta, sources, view, ss, g,
+-                                        mtp.kv_state(), e) &&
+-                                    system_prompt_cache.store_streamed(key, meta, sources, e);
++                    bool ok = true;
++                    auto bind_device = [](std::vector<strata::core::SessionKvSource>& srcs, int dev) {
++                        for (auto& s : srcs) {
++                            auto inner = std::move(s.read);
++                            s.read = [inner, dev](size_t part, size_t offset, void* dst, size_t n) -> bool {
++                                const strata::core::OnDevice on(dev);
++                                return inner(part, offset, dst, n);
++                            };
++                        }
++                    };
++                    {
++                        const strata::core::OnDevice on(0);   // stage 0 is always CUDA0
++                        ok = strata::core::conversation_snapshot_sources(stage_metas[0], stage_sources[0], view, ss, g,
++                                n_st == 0 && use_mtp ? &mtp.kv_state() : nullptr, e);
++                        if (ok) bind_device(stage_sources[0], 0);
++                    }
++                    for (size_t k = 0; ok && k < n_st; ++k) {
++                        const strata::core::OnDevice on(stages[k]->dev);
++                        ok = strata::core::conversation_snapshot_sources(stage_metas[k + 1], stage_sources[k + 1], view,
++                                stages[k]->ss, g, use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr, e);
++                        if (ok) bind_device(stage_sources[k + 1], stages[k]->dev);
++                    }
++                    ok = ok && system_prompt_cache.store_streamed(key, stage_metas, stage_sources, e);
+                     if (!ok)
+                         std::fprintf(stderr, "strata serve: system prompt cache: cannot persist the %lld-token root (%s)\n",
+                                      (long long) L, e.c_str());
+-- 
+2.53.0.windows.2
+
