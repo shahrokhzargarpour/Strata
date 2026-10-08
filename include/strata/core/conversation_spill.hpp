@@ -38,6 +38,26 @@ enum class SpillWhenFull { evict_oldest, reject };
 // directory both are inert: nothing is created and no byte is written.
 enum class SpillOn { evict, park };
 
+// Delta 5a (opt-in): what the disk tier does with a copy it would otherwise DISCARD - the compacted conversation
+// (--conversation-cache-spill-divergence-tokens), the copy a re-park supersedes, and the provisional state of a
+// cancelled request. off (the default) is the delta-4 behaviour, byte for byte: the copy is removed. ids MOVES (or,
+// for the cancellation, WRITES) only the sidecar - the token and image ids, no K/V - into the archive; state moves
+// the whole session file (the K/V included) together with the sidecar. The archive is NEVER a reuse candidate: it
+// is evidence and recovery, not a cache (the attention is causal, so an archived tail can never be a hit), so its
+// entries never enter the tier's index and best() never returns one.
+enum class SpillArchiveMode { off, ids, state };
+
+// The archive's own settings: its own folder, its own budget and its own GC, none of them shared with the tier's
+// bytes_/enforce_budget. Only used when `mode` is not off (the tier must be on: the archive lives beside it).
+struct SpillArchiveConfig {
+    std::filesystem::path directory;              // where the discarded copies are kept (default <spill-dir>/archive)
+    SpillArchiveMode mode = SpillArchiveMode::off;
+    uint64_t budget_bytes = 0;                    // the archive's own byte budget (0 = no byte budget)
+    size_t keep = 0;                              // most recent copies kept per conversation (0 = no per-conversation cap)
+    int64_t max_age_days = 0;                     // optional age retention: copies older than N days go (0 = off)
+    int64_t turn_token = -1;                      // groups archived copies into conversations (the tier's --turn-token)
+};
+
 // The header of a conversation: the tokens through its first exchange (system prompt + first user turn, ending at
 // the first assistant turn). It is the fixed part of a chat: it does not change as turns are added, and a different
 // conversation has a different one. --turn-token < 0 (no turn token) yields 0, so nothing can be called a rewrite.
@@ -118,6 +138,24 @@ public:
     // R2: copies discarded because the client rewrote the conversation's tail (a compaction or an edited history).
     size_t compacted() const { std::lock_guard<std::mutex> lk(mu_); return compacted_; }
 
+    // Delta 5a: the archive the tier MOVES its discarded copies into instead of removing them. Off by default: with
+    // mode off no directory is created and no byte is written (the tier's behaviour is byte-for-byte delta 4).
+    // `archived` is how many conversations the archive holds now, `archived_bytes` what they take (its OWN budget,
+    // never the tier's bytes_). The archive's GC is its own (enforce_archive: per-conversation keep, then budget,
+    // oldest first) and never touches the live tier; the tier's enforce_budget/enforce_age never touch the archive.
+    bool open_archive(const SpillArchiveConfig& config, std::string& error);
+    bool archive_enabled() const { std::lock_guard<std::mutex> lk(mu_); return archive_enabled_; }
+    SpillArchiveMode archive_mode() const { std::lock_guard<std::mutex> lk(mu_); return archive_mode_; }
+    size_t archived() const { std::lock_guard<std::mutex> lk(mu_); return archive_entries_.size(); }
+    uint64_t archived_bytes() const { std::lock_guard<std::mutex> lk(mu_); return archive_bytes_; }
+    size_t archive_evictions() const { std::lock_guard<std::mutex> lk(mu_); return archive_evictions_; }
+    size_t archive_age_evictions() const { std::lock_guard<std::mutex> lk(mu_); return archive_age_evictions_; }
+    // Delta 5a, gate refinement (a): the PRE-revert state of a cancelled request. Only the ids and images are
+    // archived (the K/V past the last turn boundary is the discarded answer's, not a clean prefix), so the entry is
+    // a sidecar with no session file. Never a reuse candidate; best() never returns it.
+    bool archive_provisional(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
+                             const std::vector<size_t>& checkpoint_lengths, bool cvec, std::string& error);
+
     // The best resume this directory offers for the prompt, from the sidecars only (no K/V read). similarity and
     // n_min filter weak hits exactly as the RAM cache's best() does.
     template<class Token>
@@ -191,6 +229,17 @@ private:
     void enforce_budget();
     void enforce_age();
     bool remove_entry(size_t index);
+    // Delta 5a: the discard point shared by the compaction and the supersede pass. It MOVES the entry into the
+    // archive when the archive is on, and removes it otherwise; false only when nothing left the index (a failed
+    // move/removal, exactly as a failed removal left the entry before).
+    bool discard_entry(size_t index);
+    bool archive_entry(size_t index);
+    // How many bytes a tier entry would occupy in the archive (its sidecar, plus the session files in state mode):
+    // used to refuse archiving a copy that could not fit the archive's own budget.
+    uint64_t archive_entry_bytes(const Entry& entry) const;
+    std::filesystem::path next_archive_stem();
+    bool remove_archive_entry(size_t index);
+    void enforce_archive();
     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity, std::string& error) const;
     bool write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const;
 
@@ -204,6 +253,17 @@ private:
     std::filesystem::path directory_;
     std::vector<Entry> entries_;   // oldest spill first
     std::string pinned_path_;
+    // Delta 5a: the archive (its own index, bytes and serial, none shared with the tier). The archive entries are
+    // NOT in entries_, so best() can never return one - the archive is evidence, never a reuse candidate.
+    bool archive_enabled_ = false;
+    SpillArchiveMode archive_mode_ = SpillArchiveMode::off;
+    std::filesystem::path archive_dir_;
+    uint64_t archive_budget_ = 0, archive_bytes_ = 0;
+    size_t archive_keep_ = 0, archive_evictions_ = 0, archive_age_evictions_ = 0;
+    uint64_t archive_serial_ = 0;
+    int64_t archive_turn_token_ = -1;
+    int64_t archive_max_age_days_ = 0;
+    std::vector<Entry> archive_entries_;   // oldest first
     mutable std::mutex mu_;        // the park writer drains the same directory from its own thread
 };
 

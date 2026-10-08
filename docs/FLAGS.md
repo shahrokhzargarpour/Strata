@@ -15,6 +15,7 @@ cache").
 - **`layer/delta1`** — this tree's own work on top of that base (the spill tier as overflow).
 - **`layer/delta2`** — the mirror at the park, compaction detection and cancellation (on top of delta 1).
 - **`layer/delta3`** — the batch-MTP slots across a layer split, and the device that runs the head (on top of delta 2).
+- **`layer/delta5a`** — the archive: the parking copy the tier would discard is **moved** into a subdirectory instead of removed, opt-in with the default off (on top of delta 4).
 - **`engine <version>`** — the flag came from upstream and is unchanged here.
 
 ## Three caches, not one
@@ -52,12 +53,42 @@ default **mirror** (`park`, when the tier is on) writes the conversation at the 
 | `--conversation-cache-spill-on MODE` | **`park`** | What the tier is there for. `park` (the default **when the tier is on**: a spill directory and a nonzero budget) also writes a conversation the moment it is parked at the end of a request, so a close loses at most the request in flight. `evict` is the delta-1 behaviour: only what the RAM cache evicts reaches disk. | `--serve`; inside the disk tier. **The default changes with the tier**: without `--conversation-cache-spill-dir` neither mode does anything (no folder, no byte). An unknown mode is refused at start. | The mirror writes at the end of each request, never mid-generation, and collapses a burst of parks of one conversation (one cell per conversation holding only the newest state; the async writer drains it). The disk is bounded by `--conversation-cache-disk-mib` exactly as before. | `layer/delta2` |
 | `--conversation-cache-spill-divergence-tokens N` | 4096 | A stored copy whose common prefix with the incoming prompt is shorter than N tokens, while its header (system prompt + first turn) still matches, is read as a **rewritten tail** — a compaction or an edited history — and is **discarded** (index and file) instead of being kept as an orphan. Counted in `compacted`. | `--serve`; inside the disk tier. Needs a turn token (`--turn-token`); without one nothing is ever called a rewrite. A copy the prompt **extends** is kept; one whose header differs is another conversation and is left alone. | A threshold, not a measurement: a compaction that keeps more than N tokens of common prefix is not detected and the copy is left for the GC. Prevents a compacted copy from occupying GB while it can never be a hit. | `layer/delta2` |
 | `--conversation-cache-spill-park-throttle-s N` | 0 | In `park` mode, do not rewrite the same conversation inside an N-second window; the park is postponed to a later one. | `--serve`; inside the disk tier, `park` mode only. `0` = write on every park. | A rate limiter, not a correctness lever: the newest state still ends up on disk, just on the next park outside the window. Counted in `throttled`. | `layer/delta2` |
+| `--conversation-cache-archive-mode MODE` | `off` | What the tier does with the parking copy it would otherwise **discard** — a compaction (`--conversation-cache-spill-divergence-tokens`), the copy a re-park supersedes, and the provisional state of a cancelled request. `off` (default) removes it, byte for byte as delta 4. `ids` **moves** only the sidecar (the token/image ids, no K/V). `state` moves the session file (the K/V included) with the sidecar. A cancelled request archives the state **before** the revert (the tokens it actually produced), and always as the **sidecar only** (ids + images, no K/V) even in `state` mode. | `--serve`; only inside the disk tier, and only beside a live tier. An unknown mode is refused at start. With `off` no directory is created and no byte is written. | **The archive is never a reuse candidate**: `best()` never returns one (the attention is causal, so an archived tail can never be a hit). It is evidence and recovery, not a cache, and it does not make the post-compaction read any faster. `state` is ~30 KB/token (a 45 455-token conversation measured 1 333 MiB), so bound it with `--conversation-cache-archive-mib`. The **cancellation never stores K/V** (only the pre-revert ids), even in `state` mode. | `layer/delta5a` |
+| `--conversation-cache-archive-dir DIR` | empty (`<spill-dir>\archive`) | The archive's own folder. Empty with a mode other than `off` resolves to `<spill-dir>\archive`. | `--serve`; inside the disk tier. | A subdirectory of the spill folder is fine: the tier's scan skips directories, so the archive is never counted as a stale spill file, and it is never indexed for reuse. It must **not** be the spill folder itself (refused at start). | `layer/delta5a` |
+| `--conversation-cache-archive-mib N` | 2048 | The archive's **own** byte budget (MiB), separate from `--conversation-cache-disk-mib`. The archive's GC removes the oldest archived copies over it. | `--serve`; inside the archive. `0` = no byte budget (the per-conversation cap still applies). Never touches the tier's `bytes_`, `disk_evictions` or age lever. | A separate budget, not the tier's, and it is **strict**: a copy that alone exceeds the whole budget is **not archived** (it is discarded as before), so the archive never holds more than this. The archive's GC has its own counter in the log. | `layer/delta5a` |
+| `--conversation-cache-archive-keep N` | 4 | How many copies of **one** conversation the archive keeps, newest first. The archive's GC removes the older ones. | `--serve`; inside the archive. `0` = no per-conversation cap (only `--conversation-cache-archive-mib` bounds it). | A count of archived copies, not of live ones: the live tier still holds exactly one copy per conversation. | `layer/delta5a` |
+| `--conversation-cache-archive-max-age-days N` | 0 (off) | Optional **age retention** of the archive: with a positive N the archive's own GC removes archived copies older than N days, oldest first. Mirrors the tier's `--conversation-cache-spill-max-age-days`, but for the archive. | `--serve`; inside the archive. `0` means **no retention by time at all** (the archive is then bounded only by `-mib` and `-keep`). | The **only** time-based retention of the archive; independent of the budget/keep GC, with its own counter (`by age`) in the log. | `layer/delta5a` |
 | `--conversation-cache-similarity F` | 0.0 | The least fraction of the new prompt that a stored (RAM or disk) conversation must share as a common prefix before it may be reused. | `--serve`; applies to the RAM cache and the disk tier's match. A finite number in `[0, 1)`; anything else is refused. | 0 accepts any match. It filters weak hits only: a candidate that passes still has to be an exact token/image prefix to be restored. | `layer/base` |
 | `--conversation-cache-n-min N` | 0 | The least number of common-prefix tokens a stored conversation must offer before it may be reused. | `--serve`; same place as `--conversation-cache-similarity` (RAM and disk). | 0 accepts any length. A hit that offers fewer tokens than a live slot or the RAM cache already reaches is not used. | `layer/base` |
 
 The scan never deletes: at start any file it does not understand (another model/config identity, a broken or
 missing sidecar, an orphan session file, a leftover temporary) is **ignored and counted**, not removed. Only the GC
 removes, by budget and (if enabled) by age, oldest first, with a counter and a log line.
+
+The **archive** (`--conversation-cache-archive-mode`, delta 5a) is the exception that keeps instead of removing:
+where the tier would discard the parking copy — a compaction, a superseded copy, the provisional state of a
+cancelled request — it **moves** it into a subdirectory. It is opt-in and **off by default**, so with the mode off
+the tier is byte-for-byte delta 4. It has its **own** budget (`--conversation-cache-archive-mib`) and its **own**
+GC (`--conversation-cache-archive-keep`, then the budget, oldest first, plus `--conversation-cache-archive-max-age-days`
+if set), neither of which touches the live tier's `bytes_`, `disk_evictions` or age lever. It is **never a reuse
+candidate** (its entries are not in the tier's index, so `best()` cannot return one): archiving recovers work and
+lets a client that reverts a compaction restore it, it does **not** speed up any read.
+
+**Risk and retention of the archive (operational note).** The archive keeps what the tier would have deleted, so it
+is a **larger and longer-lived exposure surface** than the tier:
+
+- **It is plaintext.** The stored `.meta` holds the conversation's token ids and image keys, and in `state` mode
+  the `.sess` holds the whole K/V. There is **no encryption** and **no secure delete**: removal (tier GC, archive
+  GC, or `--conversation-cache-archive-mode off` after the fact) is an ordinary file unlink. Treat the archive
+  folder exactly like the spill folder: keep it on a private volume with restrictive permissions (ISO/IEC 27040 /
+  ISO 15489-1 — records with access control and a retention rule).
+- **Retention is explicit and bounded only by what you set:** `--conversation-cache-archive-keep` (copies per
+  conversation), `--conversation-cache-archive-mib` (the archive's byte total) and, optionally,
+  `--conversation-cache-archive-max-age-days`. With `-max-age-days 0` (the default) there is **no deletion by
+  time**: an archived copy persists as long as it fits the byte budget. There is no other retention policy.
+- **The byte budget cannot be exceeded by a single copy:** a conversation whose archived copy alone would exceed
+  `--conversation-cache-archive-mib` is **not archived** (it is discarded exactly as without the archive), and the
+  budget GC is strict on reopen. Size `-mib` for the largest conversation you want recoverable.
 
 ## B. The system-prompt prefill cache
 

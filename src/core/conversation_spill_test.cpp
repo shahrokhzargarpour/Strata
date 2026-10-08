@@ -9,7 +9,13 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <chrono>
+#ifdef _MSC_VER
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#endif
 
 using namespace strata::core;
 namespace fs = std::filesystem;
@@ -102,6 +108,57 @@ bool buffers_equal(const ConversationBuffer& a, const ConversationBuffer& b) {
         return same;
     });
     return same && at == a.size();
+}
+
+// ---- Delta 5a helpers: an archive under test ----
+// A conversation whose header ends at the first assistant turn (turn token 500, 52 tokens), with a long tail; the
+// `compacted` member is its rewritten-tail variant (same header, tail rewritten) that discard_diverged archives.
+struct D5aConv {
+    std::vector<int32_t> ids;
+    std::vector<int32_t> compacted;
+    int64_t turn = 500;
+    size_t header = 0;
+};
+D5aConv d5a_conv(size_t tail = 5000) {
+    D5aConv c;
+    for (int32_t i = 1; i <= 10; ++i) c.ids.push_back(i);
+    c.ids.push_back((int32_t) c.turn);
+    for (int32_t i = 100; i < 120; ++i) c.ids.push_back(i);
+    c.ids.push_back((int32_t) c.turn);
+    for (int32_t i = 200; i < 220; ++i) c.ids.push_back(i);
+    c.ids.push_back((int32_t) c.turn);
+    c.header = conversation_header_length(c.ids, c.turn);
+    for (int32_t i = 300; i < (int32_t) (300 + tail); ++i) c.ids.push_back(i);
+    c.compacted.assign(c.ids.begin(), c.ids.begin() + (std::ptrdiff_t) c.header + 100);
+    for (int32_t i = 0; i < 100; ++i) c.compacted[(size_t) c.header + (size_t) i] = int32_t(70000 + i);
+    return c;
+}
+size_t d5a_count_ext(const fs::path& archive, const std::string& ext) {
+    size_t n = 0;
+    if (!fs::exists(archive)) return 0;
+    for (const auto& e : fs::directory_iterator(archive))
+        if (fs::is_regular_file(e.path()) && e.path().extension() == ext) ++n;
+    return n;
+}
+uint64_t d5a_total_bytes(const fs::path& archive) {
+    uint64_t total = 0;
+    if (!fs::exists(archive)) return 0;
+    for (const auto& e : fs::directory_iterator(archive))
+        if (fs::is_regular_file(e.path())) total += fs::file_size(e.path());
+    return total;
+}
+// The numeric suffix of every archive sidecar, ascending: "strata-conv-4.meta" -> 4.
+std::vector<uint64_t> d5a_serials(const fs::path& archive) {
+    std::vector<uint64_t> serials;
+    if (!fs::exists(archive)) return serials;
+    for (const auto& e : fs::directory_iterator(archive)) {
+        if (e.path().extension() != ".meta") continue;
+        const std::string name = e.path().stem().string();
+        const size_t at = name.rfind('-');
+        if (at != std::string::npos) serials.push_back(std::stoull(name.substr(at + 1)));
+    }
+    std::sort(serials.begin(), serials.end());
+    return serials;
 }
 } // namespace
 
@@ -551,6 +608,291 @@ int main() {
         const auto retry_hit = c.best(retry, {}, false, 0.0, 0);
         check(bool(retry_hit) && retry_hit.tokens == (int64_t) closed_len,
               "R4: the retry resumes from the closed conversation");
+    }
+
+    // ================= Delta 5a: the archive (MOVE instead of remove; opt-in, off by default) =================
+
+    // V4 / invariant 1: mode off changes nothing - no directory, no byte, counters at 0.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/off: open the tier");
+        const fs::path archive_dir = dir / "archive";
+        strata::core::SpillArchiveConfig cfg;
+        cfg.directory = archive_dir;
+        cfg.mode = SpillArchiveMode::off;
+        cfg.budget_bytes = 64ull << 20;
+        cfg.keep = 4;
+        cfg.turn_token = 500;
+        check(c.open_archive(cfg, error), "D5a/off: open_archive with mode off succeeds");
+        check(!c.archive_enabled(), "D5a/off: the archive is not enabled");
+        check(c.archived() == 0 && c.archived_bytes() == 0, "D5a/off: counters at 0");
+        check(!fs::exists(archive_dir), "D5a/off: no archive directory is created");
+        D5aConv conv = d5a_conv();
+        check(c.spill(conversation_with_ids(conv.ids), error), "D5a/off: spill a conversation");
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 1, "D5a/off: the compaction is discarded");
+        check(c.archived() == 0 && c.archived_bytes() == 0, "D5a/off: nothing was archived");
+        check(!fs::exists(archive_dir), "D5a/off: still no archive directory");
+        check(c.size() == 0, "D5a/off: the copy was removed, as in delta 4");
+    }
+
+    // V10 / gate refinement (b): the archive subdirectory never counts as a stale spill file.
+    fs::remove_all(dir);
+    {
+        fs::create_directories(dir);
+        fs::create_directories(dir / "archive");
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/stale: open with an archive subdirectory present");
+        check(c.stale_files_kept() == 0, "D5a/stale: the archive subdirectory is not counted as stale");
+        check(c.size() == 0, "D5a/stale: nothing indexed");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::ids, 64ull << 20, 4, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/stale: open the archive over the existing subdirectory");
+        check(c.stale_files_kept() == 0, "D5a/stale: still not counted after the archive is opened");
+    }
+
+    // V2 + V6 + V8 + V11: a compaction in state mode MOVES the .sess and .meta into the archive; the tier loses the
+    // copy; counters match the filesystem; the archive is never a reuse candidate; the tier's GC is untouched.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/state: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::state, 64ull << 20, 4, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/state: open the archive");
+        check(c.archive_enabled(), "D5a/state: archive enabled");
+        D5aConv conv = d5a_conv();
+        check(c.spill(conversation_with_ids(conv.ids), error), "D5a/state: spill the conversation");
+        check(c.size() == 1 && c.bytes() > 0, "D5a/state: one tier copy with bytes");
+        const size_t tier_evictions = c.disk_evictions();
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 1, "D5a/state: the compaction is detected");
+        check(c.size() == 0 && c.bytes() == 0, "D5a/state: the tier copy left the index");
+        check(c.disk_evictions() == tier_evictions, "D5a/state: the tier's GC did not evict");
+        check(c.archived() == 1, "D5a/state: archived=1");
+        check(c.archived_bytes() > 0, "D5a/state: archived_bytes>0");
+        check(d5a_count_ext(dir, ".sess") == 0, "D5a/state: no session file left in the tier");
+        check(d5a_count_ext(dir / "archive", ".sess") == 1 && d5a_count_ext(dir / "archive", ".meta") == 1,
+              "D5a/state: the session file and the sidecar moved to the archive");
+        // V6: counters consistent with the filesystem
+        check(c.archived() == d5a_count_ext(dir / "archive", ".meta"), "D5a/state: archived = sidecars in the archive");
+        check(c.archived_bytes() == d5a_total_bytes(dir / "archive"), "D5a/state: archived_bytes = archive bytes");
+        // V8: the archive is never offered by best()
+        std::vector<int32_t> cont = conv.ids;
+        cont.push_back(7777);
+        check(!bool(c.best(cont, {}, false, 0.0, 0)), "D5a/state: best() never returns an archived copy");
+    }
+
+    // V3: ids mode archives ONLY the sidecar (no .sess, no K/V) and the copy is far smaller than the state one.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/ids: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::ids, 64ull << 20, 4, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/ids: open the archive");
+        D5aConv conv = d5a_conv(2000);
+        check(c.spill(conversation_with_ids(conv.ids), error), "D5a/ids: spill the conversation");
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 1, "D5a/ids: the compaction is detected");
+        check(d5a_count_ext(dir / "archive", ".sess") == 0, "D5a/ids: no session file is archived");
+        check(d5a_count_ext(dir / "archive", ".meta") == 1 && c.archived() == 1, "D5a/ids: one sidecar-only entry");
+        // ids-sized, not K/V-sized: the sidecar writes each id as an int64, so ~8 B/token; allow generous slack
+        check(c.archived_bytes() > 0 && c.archived_bytes() < conv.ids.size() * 16 + 4096,
+              "D5a/ids: archived_bytes is ids-sized, not K/V-sized");
+        std::vector<int32_t> cont = conv.ids;
+        cont.push_back(1);
+        check(!bool(c.best(cont, {}, false, 0.0, 0)), "D5a/ids: best() never returns the archived ids");
+    }
+
+    // V5: the archive's OWN budget (-mib) trims the OLDEST and keeps the NEWEST.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/budget: open the tier");
+        strata::core::SpillArchiveConfig big{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 0, 0, 500};
+        check(c.open_archive(big, error), "D5a/budget: open the archive with no cap");
+        for (int k = 0; k < 4; ++k)
+            check(c.archive_provisional(conv_ids(20000 + k * 10, 200), {}, {}, false, error),
+                  "D5a/budget: archive a conversation");
+        check(c.archived() == 4, "D5a/budget: four archived");
+        const uint64_t budget = c.archived_bytes() / 2 + 32;   // room for about two entries
+        strata::core::SpillArchiveConfig tight{dir / "archive", SpillArchiveMode::ids, budget, 0, 0, 500};
+        check(c.open_archive(tight, error), "D5a/budget: reopen with a budget for about two");
+        check(c.archived() <= 2, "D5a/budget: the archive keeps at most two");
+        check(c.archived_bytes() <= budget, "D5a/budget: archived_bytes respects the archive's own budget");
+        check(c.archive_evictions() >= 1, "D5a/budget: the archive's GC counted the evictions");
+        check(c.disk_evictions() == 0, "D5a/budget: the tier's GC is untouched");
+        const std::vector<uint64_t> serials = d5a_serials(dir / "archive");
+        check(!serials.empty() && serials.back() == 4, "D5a/budget: the NEWEST archived entry survives");
+    }
+
+    // V7: the archive keeps at most -keep copies per conversation, and never enters the live tier.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/keep: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 1, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/keep: open the archive with keep=1");
+        const std::vector<int32_t> a = conv_ids(31000, 200);
+        check(c.archive_provisional(a, {}, {}, false, error), "D5a/keep: archive copy A1");
+        check(c.archive_provisional(a, {}, {}, false, error), "D5a/keep: archive copy A2 (same conversation)");
+        check(c.archived() == 1, "D5a/keep: only the newest copy of one conversation is kept");
+        check(c.archive_evictions() >= 1, "D5a/keep: the keep GC counted the removal");
+        check(c.archive_provisional(conv_ids(32000, 200), {}, {}, false, error), "D5a/keep: archive another conversation");
+        check(c.archived() == 2, "D5a/keep: two conversations coexist");
+        check(c.size() == 0 && c.bytes() == 0, "D5a/keep: the archive never enters the live tier");
+    }
+
+    // V9 / gate refinement (a): the cancellation archives the PRE-revert state (the generated tokens), and that
+    // archived state is never offered by best() - even after a reopen.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/cancel: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 4, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/cancel: open the archive");
+        std::vector<int32_t> closed = {1, 2, 500, 3, 4, 500, 5, 6, 500, 7, 8, 9};
+        std::vector<int32_t> pre_revert = closed;                 // the state the request produced, before the revert
+        pre_revert.push_back(500);                                // <|im_start|>assistant
+        for (int32_t i = 0; i < 40; ++i) pre_revert.push_back(int32_t(9000 + i));   // the partial answer
+        check(c.archive_provisional(pre_revert, {}, {}, false, error), "D5a/cancel: the pre-revert state is archived");
+        check(c.archived() == 1, "D5a/cancel: one archived entry");
+        check(c.size() == 0, "D5a/cancel: no tier copy is published");
+        std::vector<int32_t> retry = pre_revert;
+        retry.push_back(424242);
+        check(!bool(c.best(retry, {}, false, 0.0, 0)), "D5a/cancel: best() never returns the archived pre-revert state");
+        ConversationSpillCache again;
+        check(again.open(dir, id, 1ull << 30, error), "D5a/cancel: reopen the tier");
+        strata::core::SpillArchiveConfig cfg2{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 4, 0, 500};
+        check(again.open_archive(cfg2, error), "D5a/cancel: reopen the archive");
+        check(again.archived() == 1, "D5a/cancel: the archived pre-revert state survives a reopen");
+        check(!bool(again.best(retry, {}, false, 0.0, 0)), "D5a/cancel: still no match after reopen");
+    }
+
+    // V11 / gate refinement (c): archiving moves the copy out of the tier's bytes_ but is NOT a tier eviction, and
+    // the archive never contaminates the tier's diagnostics.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/tiercounters: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::state, 256ull << 20, 0, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/tiercounters: open the archive");
+        check(c.spill(conversation_with_ids(conv_ids(41000, 200)), error), "D5a/tiercounters: spill the other conversation");
+        const uint64_t other_only = c.bytes();
+        D5aConv conv = d5a_conv(1000);
+        check(c.spill(conversation_with_ids(conv.ids), error), "D5a/tiercounters: spill the long conversation");
+        check(c.bytes() > other_only, "D5a/tiercounters: two copies on the tier");
+        const size_t tier_evictions = c.disk_evictions();
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 1, "D5a/tiercounters: archive the long one");
+        check(c.archived() == 1, "D5a/tiercounters: it reached the archive");
+        check(c.bytes() == other_only, "D5a/tiercounters: the tier's bytes_ excludes the archive");
+        check(c.disk_evictions() == tier_evictions, "D5a/tiercounters: archiving is not a tier eviction");
+        check(c.stale_files_kept() == 0, "D5a/tiercounters: the archive does not count as stale");
+    }
+
+    // C8 / strict budget: a copy that ALONE exceeds the archive budget is NOT archived (it is discarded as before,
+    // so the archive never holds more than --conversation-cache-archive-mib).
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/oversized: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::state, 1024, 0, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/oversized: open a tiny archive budget");
+        D5aConv conv = d5a_conv(1000);
+        check(c.spill(conversation_with_ids(conv.ids), error), "D5a/oversized: spill a conversation larger than the budget");
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 1, "D5a/oversized: the compaction is detected");
+        check(c.archived() == 0 && c.archived_bytes() == 0, "D5a/oversized: nothing was archived");
+        check(c.size() == 0, "D5a/oversized: the tier copy was discarded as before");
+        check(d5a_count_ext(dir / "archive", ".meta") == 0, "D5a/oversized: no stray sidecar in the archive");
+    }
+
+    // C8 / retention by age: --conversation-cache-archive-max-age-days is the archive's own time retention.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/age: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 0, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/age: open the archive with no age retention");
+        check(c.archive_provisional(conv_ids(51000, 200), {}, {}, false, error), "D5a/age: archive one");
+        check(c.archive_provisional(conv_ids(52000, 200), {}, {}, false, error), "D5a/age: archive two");
+        check(c.archived() == 2, "D5a/age: two archived");
+        const auto old = fs::file_time_type::clock::now() - std::chrono::hours(24 * 10);
+        for (const auto& e : fs::directory_iterator(dir / "archive"))
+            if (e.path().extension() == ".meta") fs::last_write_time(e.path(), old);
+        ConversationSpillCache keep0;
+        check(keep0.open(dir, id, 1ull << 30, error), "D5a/age: reopen the tier");
+        strata::core::SpillArchiveConfig cfg0{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 0, 0, 500};
+        check(keep0.open_archive(cfg0, error), "D5a/age: reopen with max-age 0");
+        check(keep0.archived() == 2 && keep0.archive_age_evictions() == 0, "D5a/age: max-age 0 keeps the old copies");
+        strata::core::SpillArchiveConfig cfg7{dir / "archive", SpillArchiveMode::ids, 256ull << 20, 0, 7, 500};
+        check(keep0.open_archive(cfg7, error), "D5a/age: reopen with max-age 7 days");
+        check(keep0.archive_age_evictions() >= 1, "D5a/age: the age GC counted the removals");
+        check(keep0.archived() == 0, "D5a/age: every copy older than the limit went");
+    }
+
+    // O2 (audit): a failed MOVE in state mode leaves the tier entry INTACT - the discard does not happen, so the
+    // tier is never left worse than before. The failure is forced by holding the .sess open with no sharing (MSVC:
+    // _SH_DENYRW), so the rename AND the copy-then-remove fallback both fail. (On a platform without _sopen_s the
+    // case is skipped.)
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/relocate: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::state, 256ull << 20, 0, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/relocate: open the archive");
+        D5aConv conv = d5a_conv(500);
+        check(c.spill(conversation_with_ids(conv.ids), error), "D5a/relocate: spill a conversation");
+        std::string sess;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.path().extension() == ".sess") sess = e.path().string();
+        check(!sess.empty(), "D5a/relocate: the session file is on disk");
+#ifdef _MSC_VER
+        int hold = -1;
+        const errno_t held = _sopen_s(&hold, sess.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYRW, 0);
+        check(held == 0 && hold != -1, "D5a/relocate: the session file is held open exclusively");
+#endif
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 0, "D5a/relocate: the discard is not reported");
+        check(c.size() == 1 && c.bytes() > 0, "D5a/relocate: the tier entry is INTACT after the failed archive");
+        check(fs::exists(sess), "D5a/relocate: the session file is still there");
+        check(c.archived() == 0 && c.archived_bytes() == 0, "D5a/relocate: nothing was archived");
+        check(d5a_count_ext(dir / "archive", ".meta") == 0, "D5a/relocate: the archive holds no stray sidecar");
+#ifdef _MSC_VER
+        if (hold != -1) _close(hold);
+#endif
+    }
+
+    // F3 (audit addendum): force the failure AFTER a successful MOVE, so the multi-file rollback really runs. A
+    // two-stage conversation is archived in state mode: the FIRST move (.sess) succeeds, the SECOND (.stage1.sess)
+    // is held open, so archive_entry must put the .sess back and leave the tier entry intact (both files present).
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "D5a/relocate-multi: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::state, 256ull << 20, 0, 0, 500};
+        check(c.open_archive(cfg, error), "D5a/relocate-multi: open the archive");
+        D5aConv conv = d5a_conv(500);
+        SavedConversation two = conversation_with_ids(conv.ids);
+        SavedConversation stage1 = sample(600);
+        stage1.layer_lo = 48; stage1.layer_hi = 96;
+        two.stage_images.push_back(stage1);
+        check(c.spill(two, error), "D5a/relocate-multi: spill a two-stage conversation");
+        std::string sess, stage;
+        for (const auto& e : fs::directory_iterator(dir)) {
+            const std::string p = e.path().string();
+            if (p.find(".stage1.sess") != std::string::npos) stage = p;
+            else if (e.path().extension() == ".sess") sess = p;
+        }
+        check(!sess.empty() && !stage.empty(), "D5a/relocate-multi: both stage files are on disk");
+        const uint64_t bytes_before = c.bytes();
+#ifdef _MSC_VER
+        int hold = -1;
+        const errno_t held = _sopen_s(&hold, stage.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYRW, 0);
+        check(held == 0 && hold != -1, "D5a/relocate-multi: the stage file is held open exclusively");
+#endif
+        check(c.discard_diverged(conv.compacted, false, 4096, conv.turn) == 0, "D5a/relocate-multi: the discard is not reported");
+        check(c.size() == 1 && c.bytes() == bytes_before, "D5a/relocate-multi: the tier entry is INTACT (bytes unchanged)");
+        check(fs::exists(sess) && fs::exists(stage), "D5a/relocate-multi: the rolled-back .sess is back in the tier");
+        check(c.archived() == 0 && c.archived_bytes() == 0, "D5a/relocate-multi: nothing was archived");
+        check(d5a_count_ext(dir / "archive", ".meta") == 0, "D5a/relocate-multi: no stray sidecar after the rollback");
+#ifdef _MSC_VER
+        if (hold != -1) _close(hold);
+#endif
     }
 
     fs::remove_all(dir);

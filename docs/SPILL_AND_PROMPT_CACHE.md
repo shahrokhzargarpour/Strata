@@ -48,7 +48,7 @@ flowchart TD
     G --> H{"Identity and prefix valid?"}
     H -->|no| I["Rejected clean: ignored and counted, never deleted"]
     H -->|yes| R{"Client rewrote the tail (compaction)?"}
-    R -->|yes, header intact and prefix < --conversation-cache-spill-divergence-tokens| S["Discard the copy: compacted, not left orphaned"]
+    R -->|yes, header intact and prefix < --conversation-cache-spill-divergence-tokens| S["Discard the copy: compacted (or MOVE it to the archive)"]
     R -->|no| J["Validate header and hash, load, grow or compact"]
     J --> K["Re-park / re-evict: atomic replacement (temp + rename)"]
     K --> E
@@ -58,7 +58,7 @@ flowchart TD
     U -->|yes| V["By age too: oldest first"]
     U -->|no| W["No deletion by time at all"]
     A --> X{"Request cancelled? (the engine's '(cancelled)')"}
-    X -->|yes| Y["Provisional: revert the live ids to the last turn boundary; publish nothing; previous copy untouched"]
+    X -->|yes| Y["Provisional: revert the live ids to the last turn boundary; publish nothing; previous copy untouched (archive the PRE-revert ids)"]
 ```
 
 **Compaction.** The sidecar carries the conversation's own token ids, so the check needs no K/V. A stored copy
@@ -73,6 +73,29 @@ line. That state is provisional: the live ids are reverted to the last turn boun
 (`--turn-token`), no durable copy is published of it, and the previous good copy is left exactly as it was — it is
 the prefix the client resends on the retry. The harness does not matter: the decision uses only the turn token and
 the engine's cancellation signal.
+
+**Archive instead of discarding (opt-in, delta 5a).** By default the three paths that discard the parking copy —
+the compaction above, the copy a re-park supersedes, and the provisional state of a cancelled request — remove it.
+With `--conversation-cache-archive-mode ids` (or `state`) the tier **moves** the copy into a subdirectory
+(`--conversation-cache-archive-dir`, default `<spill-dir>\archive`) instead of removing it. `ids` keeps only the
+sidecar (the token and image ids, no K/V); `state` moves the session file — the K/V included — with its sidecar.
+The cancellation path archives the state **before** the revert, so it keeps the tokens the request actually
+produced (archiving after the revert would store a copy identical to the previous one). The archive is **never a
+reuse candidate**: its entries are not in the tier's index, so `best()` cannot return one — it is evidence and
+recovery, and a client that reverts a compaction can restore it in `state` mode. It has its **own** budget
+(`--conversation-cache-archive-mib`) and its **own** GC (per-conversation `keep`, then the budget, oldest first,
+plus `--conversation-cache-archive-max-age-days` if set), separate from the tier's `--conversation-cache-disk-mib`;
+the tier's GC never touches the archive and the archive never counts as a tier eviction.
+
+**Risk and retention of the archive.** The archive keeps what the tier would have deleted, so it is a larger and
+longer-lived exposure surface. It is **plaintext**: the `.meta` holds token ids and image keys and, in `state`
+mode, the `.sess` holds the whole K/V. There is **no encryption** and **no secure delete** — removal is an ordinary
+file unlink. Keep the archive folder as private as the spill folder (restrictive permissions, private volume) and
+set a retention rule deliberately: `--conversation-cache-archive-keep` (copies per conversation),
+`--conversation-cache-archive-mib` (byte total) and, optionally, `--conversation-cache-archive-max-age-days`. With
+`-max-age-days 0` (the default) an archived copy persists as long as it fits the byte budget: there is **no
+deletion by time** unless you ask for it. A conversation whose archived copy alone exceeds `-mib` is **not
+archived** (it is discarded exactly as without the archive): the archive's budget is never exceeded by one copy.
 
 ## Prefill decision tree
 
@@ -129,6 +152,11 @@ flowchart TD
   `--conversation-cache-spill-max-age-days` adds optional age pruning (0 = off);
   `--conversation-cache-spill-divergence-tokens` (4096) and `--conversation-cache-spill-park-throttle-s` (0) tune
   the compaction check and the rewrite rate.
+  The **archive** is opt-in and off by default: `--conversation-cache-archive-mode ids|state`
+  (`--conversation-cache-archive-dir`, default `<spill-dir>\archive`; `--conversation-cache-archive-mib`, default
+  2048; `--conversation-cache-archive-keep`, default 4; `--conversation-cache-archive-max-age-days`, default 0 =
+  no retention by time). With the mode `off` nothing is archived and nothing is created: the tier is
+  **byte-for-byte identical** to the behaviour without these flags.
 - System-prompt cache: `--system-prompt-cache` with `--system-prompt-cache-dir DIR`. It also needs
   `--prompt-cache > 0`, `--prompt-cache-root > 0`, a turn token and `--mtp` (without MTP the feature reports
   itself off rather than capturing a different artifact). Its folder is separate from the spill folder.
@@ -151,6 +179,17 @@ shows their counters under `/metrics` in `conversation_cache` (`disk` and `syste
 - Nothing is written with the flags absent: no folder is created and no byte is written. The mirror writes at the
   **end of a request** (the park), never mid-generation, and collapses a burst of parks of one conversation to its
   newest state; the disk cost is bounded by `--conversation-cache-disk-mib` either way.
+- The **archive** (`--conversation-cache-archive-mode`, delta 5a) is off by default: with `off` the tier is
+  **byte-for-byte identical** to the behaviour without the archive flags (no directory, no byte, counters at 0).
+  When on it keeps what the three discard paths would destroy, in its own subdirectory, with its **own** budget and
+  GC, separate from the tier's `bytes_`/`disk_evictions`/age levers. It is **never a reuse candidate** (`best()`
+  cannot return one) and it **does not speed up** any read. `state` costs like a session file per copy (~30 KB/token
+  at the measured geometry), so bound it with `--conversation-cache-archive-mib`. The archive must not be the spill
+  folder itself (refused at start, so its entries can never be indexed as reuse candidates). It is **plaintext and
+  has no secure delete** (see the risk note above); retention is `-keep` + `-mib` + optional `-max-age-days`, and a
+  copy that alone exceeds `-mib` is not archived. In a cancelled request the archive always keeps the pre-revert
+  **ids only** (the `.meta`), never the K/V, even in `state` mode: the `--conversation-cache-archive-mode` row of
+  FLAGS.md states exactly that.
 - The **mirror** pays a host copy of the parked image per park (the writer owns its own copy, so the RAM cache's
   entry is never aliased). The copy is synchronous at the park; the disk write itself is asynchronous.
 

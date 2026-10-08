@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <new>
 #include <system_error>
 
@@ -98,6 +99,26 @@ std::string stem_string(const std::filesystem::path& path) {
 
 bool is_spill_name(const std::string& name) {
     return name.rfind(kFilePrefix, 0) == 0;
+}
+
+// Delta 5a: move one file to another name, preferring the cheap same-volume rename (the archive is a subdirectory
+// of the spill directory by default). A cross-volume destination falls back to copy-then-remove, so an archive on
+// another disk still works, just not as cheaply. A FAILURE of the final removal is a failure of the move (the file
+// still exists under its old name), and the copy left behind is cleaned up so the caller sees an all-or-nothing move.
+bool relocate_file(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (!ec) return true;
+    ec.clear();
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) return false;
+    std::filesystem::remove(from, ec);
+    if (ec || std::filesystem::exists(from, ec)) {
+        std::error_code rec;
+        std::filesystem::remove(to, rec);   // the copy must not survive a failed move
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -221,6 +242,9 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
             if (ec) break;
             const std::string name = it->path().filename().string();
             if (!is_spill_name(name)) continue;
+            // Delta 5a, gate refinement (b): the archive is a subdirectory of the spill directory by default, so the
+            // scan skips directories EXPLICITLY - the archive never counts as a stale spill file.
+            if (std::filesystem::is_directory(status)) continue;
             if (!std::filesystem::is_regular_file(status)) continue;
             const std::string ext = it->path().extension().string();
             if (ext == ".meta") metas.push_back(it->path());
@@ -412,6 +436,273 @@ bool ConversationSpillCache::erase(const std::string& path, std::string& error) 
     return true;
 }
 
+// ---- Delta 5a: the archive (gate refinements a, b, c) -------------------------------------------------------------
+// The tier's three discard paths (the compaction, the supersede pass and the cancelled request's provisional park)
+// no longer destroy the state when the archive is on: the copy is MOVED into <spill-dir>/archive (a cheap rename)
+// instead of being removed. The archive has its OWN budget and its OWN GC, and its entries never enter entries_, so
+// best() can never return one: it is evidence and recovery, not a reuse candidate (the attention is causal).
+
+bool ConversationSpillCache::open_archive(const SpillArchiveConfig& config, std::string& error) {
+    std::lock_guard<std::mutex> lock(mu_);
+    archive_enabled_ = false;
+    archive_mode_ = config.mode;
+    archive_dir_ = config.directory;
+    archive_budget_ = config.budget_bytes;
+    archive_keep_ = config.keep;
+    archive_max_age_days_ = config.max_age_days < 0 ? 0 : config.max_age_days;
+    archive_turn_token_ = config.turn_token;
+    archive_serial_ = 0;
+    archive_bytes_ = 0;
+    archive_evictions_ = 0;
+    archive_age_evictions_ = 0;
+    archive_entries_.clear();
+    if (archive_mode_ == SpillArchiveMode::off || archive_dir_.empty()) return true;
+    // The archive must not BE the tier directory: its entries would then be scanned back as reuse candidates,
+    // breaking the "the archive is never a reuse candidate" invariant.
+    if (!directory_.empty() && archive_dir_.lexically_normal() == directory_.lexically_normal()) {
+        error = "archive directory must differ from the spill directory"; return false;
+    }
+    try {
+        std::error_code ec;
+        std::filesystem::create_directories(archive_dir_, ec);
+        if (ec || !std::filesystem::is_directory(archive_dir_, ec) || ec) {
+            error = "cannot create or inspect archive directory " + archive_dir_.string(); return false;
+        }
+        // The archive scan only indexes the sidecars it understands; a foreign identity or a broken sidecar is left
+        // in place (never removed). The session file is optional: an ids-mode (or provisional) entry is just .meta.
+        std::vector<std::filesystem::path> metas;
+        for (std::filesystem::directory_iterator it(archive_dir_, ec), end; !ec && it != end; it.increment(ec)) {
+            const auto status = it->symlink_status(ec);
+            if (ec) break;
+            const std::string name = it->path().filename().string();
+            if (!is_spill_name(name)) continue;
+            if (std::filesystem::is_directory(status)) continue;
+            if (!std::filesystem::is_regular_file(status)) continue;
+            if (it->path().extension().string() == ".meta") metas.push_back(it->path());
+        }
+        if (ec) { error = "cannot scan archive directory " + archive_dir_.string(); return false; }
+        std::sort(metas.begin(), metas.end());
+        for (const auto& meta : metas) {
+            Entry entry;
+            entry.stem = meta;
+            entry.stem.replace_extension();
+            bool other_identity = false;
+            std::string parse_error;
+            if (!read_sidecar(meta, entry, other_identity, parse_error)) continue;   // left in place
+            std::error_code sec;
+            uint64_t total = std::filesystem::file_size(meta, sec);
+            if (sec) total = 0;
+            std::error_code kec;
+            const uint64_t sess = std::filesystem::file_size(entry.session_path(), kec);
+            if (!kec) {
+                total += sess;
+                for (size_t k = 1; k <= entry.stages; ++k) {
+                    std::error_code pec;
+                    const uint64_t part = std::filesystem::file_size(entry.stage_path(k), pec);
+                    if (!pec) total += part;
+                }
+            }
+            entry.file_bytes = total;
+            entry.stamp = std::filesystem::last_write_time(meta, sec);
+            if (sec) entry.stamp = {};
+            archive_bytes_ += total;
+            // seed the serial from the file's own number so a fresh archive stem never collides with an old one
+            const std::string name = meta.filename().string();
+            const std::string ext = ".meta";
+            const std::string number = name.substr(std::strlen(kFilePrefix), name.size() - std::strlen(kFilePrefix) - ext.size());
+            try {
+                const uint64_t parsed = std::stoull(number);
+                if (parsed > archive_serial_) archive_serial_ = parsed;
+            } catch (...) {}
+            archive_entries_.push_back(std::move(entry));
+        }
+        std::stable_sort(archive_entries_.begin(), archive_entries_.end(),
+                         [](const Entry& a, const Entry& b) { return a.stamp < b.stamp; });
+        archive_enabled_ = true;
+        enforce_archive();
+        return true;
+    } catch (const std::exception& e) {
+        archive_entries_.clear(); archive_bytes_ = 0; archive_enabled_ = false;
+        error = std::string("cannot index archive directory: ") + e.what(); return false;
+    }
+}
+
+std::filesystem::path ConversationSpillCache::next_archive_stem() {
+    std::error_code ec;
+    for (;;) {
+        std::filesystem::path stem = archive_dir_ / (std::string(kFilePrefix) + std::to_string(++archive_serial_));
+        if (!std::filesystem::exists(stem.string() + ".meta", ec) &&
+            !std::filesystem::exists(stem.string() + ".sess", ec)) return stem;
+        ec.clear();
+    }
+}
+
+// How many bytes a tier entry would occupy in the archive: the sidecar (ids as int64 + images + checkpoints), plus
+// the session files in state mode. Used to refuse archiving a copy that alone could not fit the archive budget.
+uint64_t ConversationSpillCache::archive_entry_bytes(const Entry& entry) const {
+    const uint64_t sidecar = 64 + (uint64_t) entry.live_meta.ids.size() * 8 +
+                             (uint64_t) entry.live_meta.imgs.size() * 16 +
+                             (uint64_t) entry.checkpoint_lengths.size() * 8;
+    return archive_mode_ == SpillArchiveMode::state ? entry.file_bytes + sidecar : sidecar;
+}
+
+// The discard point shared by the compaction and the supersede pass (gate: "archivar en vez de borrar").
+bool ConversationSpillCache::discard_entry(size_t index) {
+    if (!archive_enabled_) return remove_entry(index);
+    // A copy that ALONE exceeds the archive's own budget cannot be kept under it: archiving it would only write and
+    // then delete it. Discard it as before instead, so the archive never holds more than its budget (the top can not
+    // be exceeded by a single copy). The report documents this: an oversized conversation is not archived.
+    if (archive_budget_ > 0 && archive_entry_bytes(entries_[index]) > archive_budget_) return remove_entry(index);
+    return archive_entry(index);
+}
+
+// Moves the tier entry at `index` into the archive. The sidecar is written first (so a meta-only entry is already a
+// valid archive entry); then, in state mode, the session and stage files are MOVED and, if any move fails, what
+// already reached the archive is rolled back and the tier entry is left INTACT - the discard does not happen, so the
+// tier is never left worse than before. In ids mode the session files are removed (the archive keeps the ids, not
+// the K/V). A failed sidecar write leaves the tier entry untouched too.
+bool ConversationSpillCache::archive_entry(size_t index) {
+    const Entry entry = entries_[index];   // copy: the reference dies with entries_.erase below
+    const std::string session = entry.session_path();
+    const std::string meta = entry.meta_path();
+    const size_t stages = entry.stages;
+    const uint64_t file_bytes = entry.file_bytes;
+    const std::filesystem::path stem = next_archive_stem();
+    const std::string archive_meta = stem.string() + ".meta";
+    const std::string archive_sess = stem.string() + ".sess";
+    const bool keep_state = archive_mode_ == SpillArchiveMode::state;
+    Entry archived = entry;
+    archived.stem = stem;
+    archived.stages = keep_state ? stages : 0;
+    archived.file_bytes = 0;
+    std::string write_error;
+    if (!write_sidecar(archive_meta, archived, write_error)) return false;
+    // O2 (audit): move every session file BEFORE the tier entry is touched. On any failure, put back what moved and
+    // drop the archive sidecar, leaving the tier copy intact (a failed archive is not a discard).
+    std::vector<std::pair<std::string, std::string>> moved;   // {archive path, original path}
+    if (keep_state) {
+        auto move_one = [&](const std::string& from, const std::string& to) -> bool {
+            if (!relocate_file(from, to)) return false;
+            moved.emplace_back(to, from);
+            return true;
+        };
+        bool ok = move_one(session, archive_sess);
+        for (size_t k = 1; ok && k <= stages; ++k) ok = move_one(stage_path(session, k), stage_path(archive_sess, k));
+        if (!ok) {
+            for (auto it = moved.rbegin(); it != moved.rend(); ++it) relocate_file(it->first, it->second);
+            std::error_code rec;
+            std::filesystem::remove(archive_meta, rec);
+            std::filesystem::remove(archive_sess, rec);
+            for (size_t k = 1; k <= stages; ++k) std::filesystem::remove(stage_path(archive_sess, k), rec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    // the tier's own files: the .meta was rewritten in the archive, so the original goes; in ids mode the session
+    // and stage files go too (state mode moved them above)
+    std::filesystem::remove(meta, ec);
+    if (!keep_state) {
+        std::filesystem::remove(session, ec);
+        for (size_t k = 1; k <= stages; ++k) { ec.clear(); std::filesystem::remove(stage_path(session, k), ec); }
+    }
+    std::error_code mec;
+    archived.file_bytes = std::filesystem::file_size(archive_meta, mec);
+    if (mec) archived.file_bytes = 0;
+    if (keep_state) {
+        std::error_code sec;
+        archived.file_bytes += std::filesystem::file_size(archive_sess, sec);
+        for (size_t k = 1; k <= stages; ++k) {
+            std::error_code kec;
+            archived.file_bytes += std::filesystem::file_size(stage_path(archive_sess, k), kec);
+        }
+    }
+    if (session == pinned_path_) pinned_path_.clear();
+    bytes_ -= file_bytes;
+    entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
+    archived.stamp = std::filesystem::last_write_time(archive_meta, ec);
+    if (ec) archived.stamp = std::filesystem::file_time_type::clock::now();
+    archive_bytes_ += archived.file_bytes;
+    archive_entries_.push_back(std::move(archived));
+    enforce_archive();
+    return true;
+}
+
+// Gate refinement (a): the cancellation archives the state TAL COMO SE LEYÓ (pre-revert). Only the ids and images go
+// (the K/V past the last turn boundary is the discarded answer's, not a clean prefix), so this is a sidecar-only
+// entry. It is safe because the archive is never a reuse candidate.
+bool ConversationSpillCache::archive_provisional(const std::vector<int32_t>& ids,
+                                                 const std::vector<ConversationImageKey>& imgs,
+                                                 const std::vector<size_t>& checkpoint_lengths, bool cvec,
+                                                 std::string& error) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!archive_enabled_ || ids.empty()) return false;
+    Entry entry;
+    entry.stages = 0;
+    entry.cvec = cvec;
+    entry.live_meta.ids = ids;
+    entry.live_meta.imgs = imgs;
+    entry.checkpoint_lengths = checkpoint_lengths;
+    if (!valid_meta_chain(entry.live_meta, entry.checkpoint_lengths)) {
+        error = "cancelled request state is not a valid prefix chain"; return false;
+    }
+    entry.stem = next_archive_stem();
+    const std::string meta = entry.stem.string() + ".meta";
+    if (!write_sidecar(meta, entry, error)) return false;
+    std::error_code ec;
+    entry.file_bytes = std::filesystem::file_size(meta, ec);
+    if (ec) entry.file_bytes = 0;
+    entry.stamp = std::filesystem::last_write_time(meta, ec);
+    if (ec) entry.stamp = std::filesystem::file_time_type::clock::now();
+    archive_bytes_ += entry.file_bytes;
+    archive_entries_.push_back(std::move(entry));
+    enforce_archive();
+    return true;
+}
+
+bool ConversationSpillCache::remove_archive_entry(size_t index) {
+    const Entry& entry = archive_entries_[index];
+    std::error_code ec;
+    std::filesystem::remove(entry.meta_path(), ec);
+    ec.clear();
+    std::filesystem::remove(entry.session_path(), ec);
+    for (size_t k = 1; k <= entry.stages; ++k) {
+        ec.clear();
+        std::filesystem::remove(stage_path(entry.session_path(), k), ec);
+    }
+    archive_bytes_ -= archive_bytes_ < entry.file_bytes ? archive_bytes_ : entry.file_bytes;
+    archive_entries_.erase(archive_entries_.begin() + (std::ptrdiff_t) index);
+    ++archive_evictions_;
+    return true;
+}
+
+// Gate refinement (c): the archive's OWN GC. First the per-conversation keep (newest first), then the optional age
+// retention, then the archive's own byte budget, oldest first. The budget bound is STRICT: if a single copy alone
+// exceeds the whole budget it is removed too (an entry that could not fit is never archived in the first place;
+// this covers a reopened archive whose budget shrank). It never touches the live tier's bytes_, disk_evictions_ or
+// age_evictions_.
+void ConversationSpillCache::enforce_archive() {
+    if (archive_keep_ > 0) {
+        std::map<uint64_t, size_t> seen;
+        for (size_t i = archive_entries_.size(); i-- > 0;) {
+            if (i >= archive_entries_.size()) continue;
+            const uint64_t key = conversation_key(archive_entries_[i].live_meta.ids, archive_turn_token_);
+            size_t& count = seen[key];
+            if (++count > archive_keep_) remove_archive_entry(i);
+        }
+    }
+    if (archive_max_age_days_ > 0) {
+        const std::filesystem::file_time_type now = std::filesystem::file_time_type::clock::now();
+        const std::chrono::seconds limit((int64_t) archive_max_age_days_ * 86400);
+        for (size_t i = 0; i < archive_entries_.size();) {
+            if (now - archive_entries_[i].stamp < limit) { ++i; continue; }   // the index does not advance on removal
+            remove_archive_entry(i);
+            ++archive_age_evictions_;
+        }
+    }
+    while (archive_budget_ > 0 && archive_bytes_ > archive_budget_ && !archive_entries_.empty())
+        remove_archive_entry(0);   // oldest first; the newest is kept only if it fits the budget
+}
+
 void ConversationSpillCache::pin(const std::string& path) {
     std::lock_guard<std::mutex> lock(mu_);
     pinned_path_ = path;
@@ -453,7 +744,7 @@ size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
             if (!held && same_saved_prefix(deepest, checkpoint.ids, checkpoint.imgs)) held = true;
         if (entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_ &&
             !(!keep.empty() && entry.session_path() == keep)) {
-            if (!remove_entry(i)) { ++i; continue; }   // a failed removal: leave this entry in the index
+            if (!discard_entry(i)) { ++i; continue; }  // a failed move/removal: leave this entry in the index
             ++dropped;
             continue;
         }
@@ -479,7 +770,7 @@ size_t ConversationSpillCache::discard_diverged_impl(const std::vector<int32_t>&
         if (header == 0 || common < header) { ++i; continue; }        // the headers differ: another conversation
         if (common >= divergence_tokens) { ++i; continue; }           // a small edit, not a rewritten tail
         if (entry.session_path() == pinned_path_) { ++i; continue; }
-        if (!remove_entry(i)) { ++i; continue; }                      // a failed removal: leave it in the index
+        if (!discard_entry(i)) { ++i; continue; }                     // a failed move/removal: leave it in the index
         ++discarded;
         ++compacted_;
     }

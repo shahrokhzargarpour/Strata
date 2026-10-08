@@ -620,6 +620,25 @@ struct Options {
     /// --conversation-cache-spill-park-throttle-s: 0 = write on every park; N > 0 = do not rewrite the same
     /// conversation inside N seconds (the park is postponed to a later one).
     int64_t conversation_cache_spill_park_throttle_s = 0;
+    /// --conversation-cache-archive-mode (delta 5a, opt-in): instead of destroying the parking copy in the three
+    /// paths that discard it (the compaction, the supersede pass and the cancelled request), MOVE it into an archive
+    /// subdirectory of the tier. "off" (the default) is byte-for-byte the delta-4 behaviour. "ids" keeps only the
+    /// token/image ids (the .meta sidecar, no K/V); "state" moves the session file (the .sess + its stage files)
+    /// with the sidecar. The archive is never a reuse candidate; it has its own budget and its own GC.
+    std::string conversation_cache_archive_mode = "off";
+    /// --conversation-cache-archive-dir: the archive's own folder (default <spill-dir>\archive). Empty + a mode
+    /// other than off resolves to that default.
+    std::string conversation_cache_archive_dir;
+    /// --conversation-cache-archive-mib: the archive's OWN byte budget (MiB), separate from the tier's
+    /// --conversation-cache-disk-mib. Its GC removes the oldest archived copies over it. 0 = no byte budget.
+    int64_t conversation_cache_archive_mib = 2048;
+    /// --conversation-cache-archive-keep: how many copies of ONE conversation the archive keeps (newest first).
+    /// 0 = no per-conversation cap (only the archive's byte budget bounds it).
+    int64_t conversation_cache_archive_keep = 4;
+    /// --conversation-cache-archive-max-age-days: optional age retention for the archive (0 = off, no deletion by
+    /// time at all; positive = the archive's own GC drops copies older than that, oldest first). Mirrors the tier's
+    /// --conversation-cache-spill-max-age-days, but for the archive.
+    int64_t conversation_cache_archive_max_age_days = 0;
     /// --system-prompt-cache (F5, opt-in): persist the checkpoint root that ends the system prompt (the one
     /// --prompt-cache-root builds in RAM) as an ordinary session file, and reload it at start so a NEW chat reads
     /// only the tokens after it. Off by default: no directory is created and no byte is written.
@@ -788,6 +807,19 @@ void usage() {
                  "                       tail (a compaction): it is discarded, not kept (default 4096)\n"
                  "  --conversation-cache-spill-park-throttle-s N  --serve, park mode: do not rewrite the same\n"
                  "                       conversation inside an N-second window (default 0 = write on every park)\n"
+                 "  --conversation-cache-archive-mode MODE  --serve: instead of discarding the parking copy in the\n"
+                 "                       three paths that do (a compaction, a supersede pass, a cancelled request),\n"
+                 "                       MOVE it into an archive subdirectory. off (default) = the current behaviour\n"
+                 "                       byte for byte; ids = only the token/image ids (.meta, no K/V); state = the\n"
+                 "                       session file too. The archive is never a reuse candidate\n"
+                 "  --conversation-cache-archive-dir DIR  --serve: the archive's own folder (default <spill-dir>\\archive)\n"
+                 "  --conversation-cache-archive-mib N  --serve: the archive's OWN byte budget, separate from\n"
+                 "                       --conversation-cache-disk-mib; its GC removes the oldest over it (default 2048;\n"
+                 "                       0 = no byte budget)\n"
+                 "  --conversation-cache-archive-keep N  --serve: how many copies of one conversation the archive keeps,\n"
+                 "                       newest first (default 4; 0 = no per-conversation cap)\n"
+                 "  --conversation-cache-archive-max-age-days N  --serve: prune archived copies older than N days,\n"
+                 "                       oldest first (default 0 = off; no retention by time at all)\n"
                  "  --system-prompt-cache  --serve: persist the system-prompt checkpoint root (--prompt-cache-root) to\n"
                  "                       disk and reload it at start, so a new chat of the same client reads only the\n"
                  "                       tokens after it (default off; needs --system-prompt-cache-dir)\n"
@@ -1851,6 +1883,30 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-spill-divergence-tokens") o.conversation_cache_spill_divergence_tokens = number;
             else o.conversation_cache_spill_park_throttle_s = number;
+        }
+        else if (a == "--conversation-cache-archive-mode") {
+            const std::string value = next("--conversation-cache-archive-mode");
+            if (value != "off" && value != "ids" && value != "state") {
+                std::fprintf(stderr, "--conversation-cache-archive-mode takes off, ids or state\n");
+                return 2;
+            }
+            o.conversation_cache_archive_mode = value;
+        }
+        else if (a == "--conversation-cache-archive-dir") o.conversation_cache_archive_dir = next("--conversation-cache-archive-dir");
+        else if (a == "--conversation-cache-archive-mib" || a == "--conversation-cache-archive-keep" ||
+                 a == "--conversation-cache-archive-max-age-days") {
+            const std::string value = next(a.c_str());
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            const int64_t limit = a == "--conversation-cache-archive-keep" ? INT32_MAX :
+                                  a == "--conversation-cache-archive-max-age-days" ? INT64_MAX / 86400 : INT64_MAX / (1024 * 1024);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-cache-archive-mib") o.conversation_cache_archive_mib = number;
+            else if (a == "--conversation-cache-archive-keep") o.conversation_cache_archive_keep = number;
+            else o.conversation_cache_archive_max_age_days = number;
         }
         else if (a == "--system-prompt-cache") o.system_prompt_cache = true;
         else if (a == "--system-prompt-cache-dir") o.system_prompt_cache_dir = next("--system-prompt-cache-dir");
@@ -6672,6 +6728,33 @@ int main(int argc, char** argv) {
                                  conversation_spill.oversized_files_kept(), conversation_spill.stale_files_kept(),
                                  conversation_spill.foreign_files_kept(), conversation_spill.orphan_files_kept(),
                                  conversation_spill.disk_evictions(), conversation_spill.age_evictions());
+                    // Delta 5a: the archive. Off unless --conversation-cache-archive-mode is ids or state; with off
+                    // no directory is created and no byte is written (the tier stays byte-for-byte delta 4). Its own
+                    // folder, its own budget and its own GC; it exists only beside a live tier.
+                    std::string archive_error;
+                    strata::core::SpillArchiveConfig archive_config;
+                    archive_config.directory = o.conversation_cache_archive_dir.empty()
+                        ? (std::filesystem::path(o.conversation_cache_spill_dir) / "archive")
+                        : std::filesystem::path(o.conversation_cache_archive_dir);
+                    archive_config.mode = o.conversation_cache_archive_mode == "ids" ? strata::core::SpillArchiveMode::ids
+                                        : o.conversation_cache_archive_mode == "state" ? strata::core::SpillArchiveMode::state
+                                                                                       : strata::core::SpillArchiveMode::off;
+                    archive_config.budget_bytes = (uint64_t) o.conversation_cache_archive_mib * 1024 * 1024;
+                    archive_config.keep = (size_t) o.conversation_cache_archive_keep;
+                    archive_config.max_age_days = o.conversation_cache_archive_max_age_days;
+                    archive_config.turn_token = o.turn_token;
+                    if (!conversation_spill.open_archive(archive_config, archive_error)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: archive disabled (%s)\n", archive_error.c_str());
+                    } else if (conversation_spill.archive_enabled()) {
+                        std::fprintf(stderr, "strata serve: conversation cache: archive ready (%s, %zu archived, %llu MiB, "
+                                     "mib=%lld, keep=%lld, max-age=%lld d, %zu archive evictions [%zu by age])\n",
+                                     o.conversation_cache_archive_mode.c_str(), conversation_spill.archived(),
+                                     (unsigned long long) (conversation_spill.archived_bytes() >> 20),
+                                     (long long) o.conversation_cache_archive_mib,
+                                     (long long) o.conversation_cache_archive_keep,
+                                     (long long) o.conversation_cache_archive_max_age_days,
+                                     conversation_spill.archive_evictions(), conversation_spill.archive_age_evictions());
+                    }
                 }
             }
         }
@@ -6875,10 +6958,12 @@ int main(int argc, char** argv) {
                     }
                 }
                 const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu archived=%zu archived_bytes=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                             conversations.size(), conversations.bytes(), conversations.evictions(),
+                             conversation_spill.archived(), (size_t) conversation_spill.archived_bytes(),
+                             snapshot_bytes, reused_bytes);
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -10623,6 +10708,17 @@ int main(int argc, char** argv) {
                 // provisional so no durable copy is published of it (the previous good copy is left alone). The
                 // K/V past the boundary belongs to the discarded answer and is re-read on the retry.
                 const size_t reached = (size_t) std::max<int64_t>(0, std::min<int64_t>(pp_reached, (int64_t) consumed.size()));
+                // Delta 5a, gate refinement (a): archive the PRE-revert state. revert_to_turn_boundary() below
+                // drops the partial answer, so archiving AFTER the revert would store a copy identical to the
+                // previous one (no value). The archive takes the ids the request actually produced, before the
+                // revert; it is never a reuse candidate, so an inconsistent-as-prefix state is safe there.
+                if (conversation_spill.archive_enabled() && !consumed.empty()) {
+                    std::string archive_error;
+                    if (!conversation_spill.archive_provisional(consumed,
+                            imgs_below(req_imgs, (int64_t) consumed.size()), {}, cvec_cached, archive_error))
+                        std::fprintf(stderr, "strata serve: conversation cache: archive of the cancelled request failed (%s)\n",
+                                     archive_error.c_str());
+                }
                 std::vector<int32_t> reverted = consumed;
                 if (strata::core::revert_to_turn_boundary(reverted, o.turn_token, reached)) {
                     live.swap(reverted);
