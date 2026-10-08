@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "layer": "strata-agnostic-layer",
-  "layer_version": "0.3.2",
-  "descripcion": "Capa aditiva sobre Strata: tier de disco para slots/conversaciones en desuso (con layer-split) y caché de prefill del system prompt. Inerte sin flags.",
+  "layer_version": "0.4.0",
+  "descripcion": "Capa aditiva sobre Strata: tier de disco para slots/conversaciones en desuso (con layer-split), archivo (no borrado) de la copia de parking y caché de prefill del system prompt. Inerte sin flags.",
   "base": {
     "upstream": "https://github.com/Niko1221/Strata",
     "tag": "v0.1.40.1",
@@ -40,6 +40,13 @@
     "delta_3": [
       "--head-device",
       "--batch-mtp"
+    ],
+    "delta_5a": [
+      "--conversation-cache-archive-mode",
+      "--conversation-cache-archive-dir",
+      "--conversation-cache-archive-mib",
+      "--conversation-cache-archive-keep",
+      "--conversation-cache-archive-max-age-days"
     ]
   },
   "anclas": [
@@ -75,7 +82,18 @@
     { "id": "A30", "archivo": "src/program/generate.cpp", "patron": "MTP drafts accepted %lld of %lld", "que_protege": "delta 3 (medicion): la linea resumen `strata batch:` reporta la aceptacion MTP del periodo (lo que lee el Monitor)" },
     { "id": "A31", "archivo": "src/program/generate.cpp", "patron": "bt_drafts.observe", "que_protege": "delta 3 (medicion): el motor USA el acumulador en la ventana de batch (por slot para el BDONE y por periodo para el resumen)" },
     { "id": "A32", "archivo": "tests/core/stage_plan_test.cpp", "patron": "DraftAccept", "que_protege": "delta 3 (medicion): el test host-only que fija el acumulador (73 -> 79 checks)" },
-    { "id": "A33", "archivo": "serve/server.py", "patron": "def bdone_drafts", "que_protege": "delta 3 (medicion): el parser del server lee el sufijo del BDONE (accepted, offered) y tolera su ausencia" }
+    { "id": "A33", "archivo": "serve/server.py", "patron": "def bdone_drafts", "que_protege": "delta 3 (medicion): el parser del server lee el sufijo del BDONE (accepted, offered) y tolera su ausencia" },
+    { "id": "A34", "archivo": "include/strata/core/conversation_spill.hpp", "patron": "SpillArchiveMode", "que_protege": "delta 5a: los modos del archivo (off/ids/state) y su configuracion existen" },
+    { "id": "A35", "archivo": "include/strata/core/conversation_spill.hpp", "patron": "archive_provisional", "que_protege": "delta 5a: el archivo del estado PRE-revert de un pedido cancelado (refinamiento a del gate)" },
+    { "id": "A36", "archivo": "src/core/conversation_spill.cpp", "patron": "discard_entry", "que_protege": "delta 5a: el punto unico de descarte (mueve al archivo o borra) que reemplaza remove_entry en compactacion y superseded" },
+    { "id": "A37", "archivo": "src/core/conversation_spill.cpp", "patron": "archive_entry", "que_protege": "delta 5a: el MOVE de la copia al subdirectorio del archivo (rename temp, byte-identico)" },
+    { "id": "A38", "archivo": "src/core/conversation_spill.cpp", "patron": "enforce_archive", "que_protege": "delta 5a: el GC PROPIO del archivo (keep por conversacion + presupuesto propio), separado del tier (refinamiento c)" },
+    { "id": "A39", "archivo": "src/program/generate.cpp", "patron": "--conversation-cache-archive-mode", "que_protege": "delta 5a: parser de args de los flags del archivo (un flag desconocido sigue siendo error fatal)" },
+    { "id": "A40", "archivo": "src/program/generate.cpp", "patron": "archive_provisional", "que_protege": "delta 5a: el motor USA el archivo pre-revert en la cancelacion (no una copia inline divergente)" },
+    { "id": "A41", "archivo": "src/core/conversation_spill_test.cpp", "patron": "d5a_conv", "que_protege": "delta 5a: los casos host-only del archivo (off/ids/state, tope, keep, no-matching, cancelacion pre-revert, stale, contadores del tier)" },
+    { "id": "A42", "archivo": "docs/FLAGS.md", "patron": "--conversation-cache-archive-mode", "que_protege": "delta 5a: los flags del archivo documentados (con la garantia apagado = identico)" },
+    { "id": "A43", "archivo": "src/program/generate.cpp", "patron": "--conversation-cache-archive-max-age-days", "que_protege": "delta 5a: la retencion por edad del archivo (flag coherente con --conversation-cache-spill-max-age-days)" },
+    { "id": "A44", "archivo": "docs/SPILL_AND_PROMPT_CACHE.md", "patron": "no encryption", "que_protege": "delta 5a: el riesgo operativo del archivo (privacidad, no cifrado, sin borrado seguro, retencion) declarado en la doc" }
   ],
   "invariantes": [
     "Con los flags ausentes: paridad de tokens con upstream (inerte).",
@@ -94,7 +112,14 @@
     "Delta 3 (fail-open): --batch-mtp NUNCA termina el proceso. Si un drafter de slot no se puede construir, o si su tipo de draft head no tiene camino MMVQ nativo, o si un draft falla en runtime, el flag se apaga con el motivo en el log y los slots siguen decodificando sin drafts.",
     "Delta 3 (defecto de upstream, arreglado aqui): un drafter de slot COMPARTE el draft head del drafter principal (dhead_/dvocab_) y debe compartir su FORMATO. En la base, dhead_type_ quedaba en -1 y native_mmvq(-1, ...) lanzaba 'unsupported native MMVQ GGML type' en la primera admision; el motor salia con exit 1.",
     "Delta 3a: una ventana de batch con varias filas consecutivas del MISMO slot (lo que produce --batch-mtp: 1 token confirmado + 1 drafteado por slot) cruza el hand-off de un layer split. El hand-off es por FILA de la ventana (hrow0 + t), contiguo e indexado igual en cada etapa, asi que una fila repetida no lo rompe; el estado por slot (GDN, QSA/indexer, PLE) ya se maneja por grupos de filas contiguas del mismo slot. El techo es la capacidad del hand-off (kVerifyMaxT filas), NO el conteo de slots.",
-    "Delta 3a (fail-open): el guard 'grouped slot rows do not support a layer split yet' que terminaba el motor (exit 1) en plena admision ya no esta; una ventana que de verdad no entra se rechaza ANTES de capturar un grafo. Con una sola GPU o sin --batch-mtp el max_t_ de la ventana es max(--spec, --batch) y el comportamiento es el de la base."
+    "Delta 3a (fail-open): el guard 'grouped slot rows do not support a layer split yet' que terminaba el motor (exit 1) en plena admision ya no esta; una ventana que de verdad no entra se rechaza ANTES de capturar un grafo. Con una sola GPU o sin --batch-mtp el max_t_ de la ventana es max(--spec, --batch) y el comportamiento es el de la base.",
+    "Delta 5a: con --conversation-cache-archive-mode off (default) el tier de disco es BYTE POR BYTE identico a delta 4: no se crea directorio, no se escribe byte nuevo, los contadores quedan en 0.",
+    "Delta 5a: el archivo NUNCA es candidato de reuso - sus entradas no entran en el indice del tier, asi que best() no puede devolver una (atencion causal). Es evidencia/recuperacion, no cache.",
+    "Delta 5a: el presupuesto y el GC del archivo (--conversation-cache-archive-mib + --conversation-cache-archive-keep, mas viejo primero) son PROPIOS; no tocan bytes_, disk_evictions() ni enforce_age() del tier, y el escaneo del tier no lo cuenta como stale (salta directorios).",
+    "Delta 5a: una copia por conversacion en el tier VIVO; el archivo puede retener hasta --conversation-cache-archive-keep copias historicas de una conversacion. Sigue mandando la identidad (modelo+config) del session file.",
+    "Delta 5a: la cancelacion archiva el estado PRE-revert (los ids que el pedido produjo, antes de revert_to_turn_boundary); archivar despues guardaria una copia identica a la anterior (valor nulo).",
+    "Delta 5a: el tope del archivo NO puede superarse: una copia que por si sola excede --conversation-cache-archive-mib no se archiva (se descarta como antes), y el GC del presupuesto es estricto al reabrir. La retencion es por keep + presupuesto + (opcional) --conversation-cache-archive-max-age-days; no hay otra politica.",
+    "Delta 5a: ante un fallo del MOVE en modo state, archive_entry revierte lo que ya llego al archivo y deja la entrada del TIER INTACTA (el descarte no ocurre): el tier nunca queda peor que antes."
   ],
   "no_afirmaciones": [
     "La atencion es causal: no se puede conservar la cola de una conversacion bajo un system prompt distinto.",
@@ -109,6 +134,12 @@
     "Delta 3: el ARREGLO del tipo del draft head esta cubierto host-only (draft_head_type + slot_mtp_reason en stage_plan_test) pero NO se verifico en vivo con el modelo: las dos GPUs las ocupa produccion (:5011) y :5012 no tiene listener. El binario arreglado se probo solo hasta compilar y pasar la bateria host-only.",
     "Delta 3: el defecto del tipo es de UPSTREAM (src/core/mtp.cpp no lo toca esta capa y v0.1.40.1/main tienen la misma omision en el bloque `shared != nullptr` de bind()); nuestro arreglo de una linea y el guard de arranque son un delta propio, y el aporte al upstream es que su --batch-mtp en UNA GPU falla igual cuando el rt trae draft_vocab.bin.",
     "Delta 3a: la verificacion BIT A BIT solo-vs-batch CON layer split y el tok/s de --batch-mtp bajo split NO se midieron en esta maquina: las dos GPUs las ocupa produccion (:5011) y el contrato pide no tocar ese runtime. El binario arreglado se probo hasta COMPILAR (strata.exe, exit 0) y la BATERIA HOST-ONLY (10/10) mas el verificador de capa; el E2E de 4 concurrentes y la paridad bit a bit quedan PENDIENTES con su comando exacto, pedidos como ventana de GPU en el informe.",
-    "Delta 3a: el guard que terminaba el motor estaba en UPSTREAM (main tiene el mismo `if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr)`); el rango por slots_.size() y el max_t_ del split tambien. Este delta los corrige localmente y es candidato a aporte."
+    "Delta 3a: el guard que terminaba el motor estaba en UPSTREAM (main tiene el mismo `if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr)`); el rango por slots_.size() y el max_t_ del split tambien. Este delta los corrige localmente y es candidato a aporte.",
+    "Delta 5a: el archivo (delta 5a) NO fue medido end-to-end con el modelo cargado: ni el archivo, ni la compactacion, ni la cancelacion. Los 249 checks host-only y el enlace CUDA son lo unico verificado.",
+    "Delta 5a: NO acelera la lectura posterior a la compactacion; solo recupera trabajo y permite restaurar en modo state si el cliente revierte la compactacion.",
+    "Delta 5a: el modo state cuesta como un session file por copia (~30 KB/token en el caso medido de produccion: spilled 45455 tokens = 1333 MiB); hay que acotarlo con --conversation-cache-archive-mib.",
+    "Delta 5a: el modo ids archiva el sidecar con los ids como int64 (~8 B/token), no los ~4 B/token del presupuesto del diseno; el formato del sidecar (una sola forma, version 2) no se cambio para no romper la compatibilidad de lectura.",
+    "Delta 5a: la cancelacion archiva SOLO el sidecar (ids + imagenes) del estado pre-revert; no persiste el K/V de ese estado (el K/V mas alla del ultimo limite de turno es el de la respuesta descartada). En modo state, la compactacion y el superseded si mueven el session file completo.",
+    "Delta 5a: el archivo NO esta cifrado y std::filesystem::remove es un unlink normal (sin borrado seguro): la carpeta del archivo debe ser tan privada como la del spill (contiene tokens, imagenes y, en state, el K/V). No hay retencion por edad salvo que se ponga --conversation-cache-archive-max-age-days."
   ]
 }
