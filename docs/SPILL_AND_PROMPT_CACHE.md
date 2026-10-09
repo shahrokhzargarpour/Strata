@@ -68,6 +68,14 @@ an edited history): it can never be a hit, so it is discarded — index and file
 the prompt extends is the normal turn and is kept; a copy whose header differs is another conversation and is left
 alone.
 
+Sharing the header is necessary, not sufficient: a template that carries few-shot turns inside the system prompt
+puts the header inside the root every session of that assistant shares, so a sibling satisfies the test too. Among
+the copies whose header the prompt shares, only the one sharing the **longest** prefix with it is the conversation
+being compacted, and that one alone is discarded — a sibling session keeps its copy. When copies tie at that length
+and are not copies of one another the owner cannot be told apart from the sidecars, so **nothing** is discarded and
+the tie is logged: a stale copy costs bytes, a sibling's copy is a session. Every copy the tier archives logs the
+conversation key that owned it.
+
 **Cancellation.** A request the client aborts (Escape-Escape in a TUI) ends with the engine's own `(cancelled)`
 line. That state is provisional: the live ids are reverted to the last turn boundary the read actually reached
 (`--turn-token`), no durable copy is published of it, and the previous good copy is left exactly as it was — it is

@@ -991,6 +991,55 @@ int main() {
         check(c.size() == 2, "X: both siblings are on the tier again");
     }
 
+    // T2 ETAPA A, the fail-safe half: when a compaction keeps nothing but the shared root, the tier cannot tell A's
+    // copy from B's - both match the prompt at exactly the same length and they are not copies of one another - so
+    // the owner is undecidable from the sidecars and NOTHING is discarded. A stale copy costs bytes; archiving a
+    // sibling's copy loses a session.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "X/ambiguous: open the tier");
+        const XSession a = x_session(1, 1000), b = x_session(2, 1000);
+        check(c.spill(conversation_with_ids(a.ids), error), "X/ambiguous: A parked its copy");
+        check(c.spill(conversation_with_ids(b.ids), error), "X/ambiguous: B parked its copy");
+        std::vector<int32_t> root_only(a.ids.begin(), a.ids.begin() + (std::ptrdiff_t) a.root);
+        for (size_t i = 0; i < 50; ++i) root_only.push_back((int32_t) (95000 + i));
+        check(x_shared_prefix(a.ids, root_only) == x_shared_prefix(b.ids, root_only),
+              "X/ambiguous: both copies match the prompt at exactly the same length");
+        check(c.discard_diverged(root_only, false, 4096, a.turn) == 0,
+              "X/ambiguous: an undecidable owner discards nothing");
+        check(c.size() == 2 && c.compacted() == 0, "X/ambiguous: both siblings kept their copies");
+    }
+
+    // ---- T2 ETAPA A / A3: drop_superseded keeps a NARROWER cross-session path (documented, not closed here) ----
+    // Its match is exact: the entry is superseded when the request carries -as its own ids or as one of its
+    // checkpoints- a prefix whose length equals the entry's DEEPEST checkpoint length and whose tokens are the
+    // entry's first tokens. Two siblings of one assistant share the system prompt, so when a checkpoint boundary
+    // falls INSIDE that shared root (a template with few-shot turns in the system prompt puts message boundaries
+    // there) both siblings have a deepest checkpoint of the same length and identical tokens up to it: the pass
+    // cannot tell them apart from the sidecars and archives the sibling's copy too. A's own copy is protected here
+    // with `keep`, so the copy this drops can only be B's.
+    // This is NOT the delta 5a defect (that one swept the tier from a single compaction, with no exact-length
+    // match) and closing it needs a positive conversation identity in the sidecar, not another prefix heuristic:
+    // a longest-prefix rule would drop the sibling whenever A has no copy on the tier. Pinned as-is; if the A3-R
+    // guard lands, the check below fails and points back here.
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "A3: open the tier");
+        const XSession a = x_session(1, 1000), b = x_session(2, 1000);
+        std::string a_path, b_path;
+        check(c.spill(conversation_with_ids(a.ids, 50), error, &a_path), "A3: A parked its copy");
+        check(c.spill(conversation_with_ids(b.ids, 50), error, &b_path), "A3: B parked its copy");
+        ConversationCheckpoint cp50 = checkpoint(50, 9);
+        cp50.ids.assign(a.ids.begin(), a.ids.begin() + 50);   // the shared root: identical for every sibling
+        const size_t dropped = c.drop_superseded(a.ids, {}, {cp50}, false, a_path);
+        std::fprintf(stderr, "A3: drop_superseded dropped %zu (tier=%zu, B survived=%d)\n",
+                     dropped, c.size(), fs::exists(b_path) ? 1 : 0);
+        check(dropped == 1 && c.size() == 1 && !fs::exists(b_path) && fs::exists(a_path),
+              "A3/known: a checkpoint inside the shared root supersedes the SIBLING's copy (A3-R pending)");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_spill_test: %d checks passed\n", checks);
     return 0;

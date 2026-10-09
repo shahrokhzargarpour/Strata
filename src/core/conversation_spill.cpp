@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -24,6 +25,14 @@ constexpr char kMetaMagic[4] = {'S', 'C', 'S', 'M'};   // Strata conversation-sp
 constexpr uint32_t kMetaVersion = 2;                   // v2 adds the stage count; v1 (single image) is still read
 constexpr size_t kMaxSidecarEntries = 256;
 constexpr char kFilePrefix[] = "strata-conv-";
+
+// How many tokens two id lists share from the start (T2 ETAPA A: the ownership test of the discard pass).
+size_t shared_prefix(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+    const size_t n = a.size() < b.size() ? a.size() : b.size();
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
 
 // A small length-delimited writer/reader for the sidecar, with a trailing hash of the payload (the same
 // SessionHasher the session file uses) so a truncated or edited sidecar is refused rather than trusted.
@@ -623,6 +632,15 @@ bool ConversationSpillCache::archive_entry(size_t index) {
     if (ec) archived.stamp = std::filesystem::file_time_type::clock::now();
     archive_bytes_ += archived.file_bytes;
     archive_entries_.push_back(std::move(archived));
+    // T2 ETAPA A: every archived copy names the conversation it belonged to. The defect this fixed was a discard
+    // that could not be traced to its owner (one request, several sessions); from here every entry that leaves the
+    // tier says which conversation owned it, in the same key the park writer used for it.
+    std::fprintf(stderr, "strata spill: archived the discarded copy of conversation %016llx (%zu tokens, %s): "
+                 "%s -> %s\n",
+                 (unsigned long long) conversation_key(entry.live_meta.ids, archive_turn_token_),
+                 entry.live_meta.ids.size(), keep_state ? "state" : "ids",
+                 std::filesystem::path(session).filename().string().c_str(),
+                 std::filesystem::path(archive_meta).filename().string().c_str());
     enforce_archive();
     return true;
 }
@@ -753,24 +771,67 @@ size_t ConversationSpillCache::drop_superseded(const std::vector<int32_t>& ids,
     return dropped;
 }
 
+// R2 + T2 ETAPA A. The copy a request supersedes is the copy of THIS conversation, and the tier's only evidence of
+// "this conversation" is the token prefix, so the pass carries the R2 guards plus one ownership guard:
+//   the cell - the stored copy's header must lie inside the shared prefix. That IS the cell test: conversation_key
+//     (hpp:75) hashes exactly those header tokens, so `shared >= header(stored)` accepts the same copies and no
+//     others. Comparing whole keys is NOT usable as a necessary condition: a compaction may rewrite the very turn
+//     marker that ends the header, changing the key of its own conversation (conversation_spill_test's R2 case is
+//     exactly that shape, and it must still discard its own copy); and
+//   the divergence - the shared prefix stops before --conversation-cache-spill-divergence-tokens, so a small edit
+//     keeps its copy, and a prompt that EXTENDS the copy is the normal turn; and
+//   the ownership - only the copy sharing the LONGEST prefix with the prompt is the one being compacted. A sibling
+//     session of the same assistant shares the system prompt alone, so it always matches strictly less than its own
+//     compacted copy (a compaction keeps the head of the conversation it summarises). Before this guard the pass
+//     swept the whole tier on every request and any copy that merely reached its own header was discarded with it:
+//     with a chat template that carries few-shot turns inside the system prompt, the third turn marker - what
+//     conversation_header_length calls the end of the header - falls inside the shared root, so every sibling of
+//     that assistant satisfied it and one request archived several sessions at once.
+// Several copies tied at the longest prefix are one conversation only while they agree past that point (two parked
+// copies of a conversation are prefixes of one another). When they do not, the owner cannot be told apart from the
+// sidecars alone and NOTHING is discarded: a stale copy costs bytes, a sibling's copy is a session.
 size_t ConversationSpillCache::discard_diverged_impl(const std::vector<int32_t>& prompt, bool cvec,
                                                      size_t divergence_tokens, int64_t turn_token) {
     std::lock_guard<std::mutex> lock(mu_);
     if (!enabled_ || prompt.empty() || turn_token < 0) return 0;
+    // How many tokens a stored copy shares with the prompt, or 0 when it is not a candidate at all: a candidate
+    // always shares at least its own header, and a header is never empty here.
+    auto shared_of = [&](size_t index) -> size_t {
+        const Entry& entry = entries_[index];
+        if (entry.cvec != cvec) return 0;                                          // another steering mode
+        const size_t header = conversation_header_length(entry.live_meta.ids, turn_token);
+        if (header == 0) return 0;
+        const size_t shared = shared_prefix(entry.live_meta.ids, prompt);
+        if (shared == entry.live_meta.ids.size()) return 0;                         // the prompt extends it
+        if (shared < header) return 0;                                              // the headers differ
+        if (shared >= divergence_tokens) return 0;                                  // a small edit, not a rewrite
+        if (entry.session_path() == pinned_path_) return 0;                         // mid-restore
+        return shared;
+    };
+    std::vector<std::pair<size_t, size_t>> candidates;   // {entry index, tokens shared with the prompt}
+    for (size_t i = 0; i < entries_.size(); ++i)
+        if (const size_t shared = shared_of(i)) candidates.emplace_back(i, shared);
+    size_t longest = 0;
+    for (const auto& candidate : candidates) longest = std::max(longest, candidate.second);
+    if (!longest) return 0;
+    size_t owner = SIZE_MAX;
+    for (const auto& candidate : candidates)
+        if (candidate.second == longest) { owner = candidate.first; break; }
+    for (const auto& candidate : candidates) {
+        if (candidate.first == owner || candidate.second != longest) continue;
+        if (shared_prefix(entries_[owner].live_meta.ids, entries_[candidate.first].live_meta.ids) > longest) continue;
+        std::fprintf(stderr, "strata spill: conversation %016llx: %zu copies tie at %zu tokens and are not copies "
+                     "of one another; nothing discarded (the owner is undecidable from the sidecars)\n",
+                     (unsigned long long) conversation_key(prompt, turn_token), candidates.size(), longest);
+        return 0;
+    }
     size_t discarded = 0;
-    for (size_t i = 0; i < entries_.size();) {
-        const Entry& entry = entries_[i];
-        if (entry.cvec != cvec) { ++i; continue; }                    // another steering mode: another conversation
-        const std::vector<int32_t>& stored = entry.live_meta.ids;
-        const size_t n = stored.size() < prompt.size() ? stored.size() : prompt.size();
-        size_t common = 0;
-        while (common < n && stored[common] == prompt[common]) ++common;
-        if (common == stored.size()) { ++i; continue; }               // the prompt extends it: the normal turn
-        const size_t header = conversation_header_length(stored, turn_token);
-        if (header == 0 || common < header) { ++i; continue; }        // the headers differ: another conversation
-        if (common >= divergence_tokens) { ++i; continue; }           // a small edit, not a rewritten tail
-        if (entry.session_path() == pinned_path_) { ++i; continue; }
-        if (!discard_entry(i)) { ++i; continue; }                     // a failed move/removal: leave it in the index
+    for (size_t i = entries_.size(); i-- > 0;) {   // descending: discard_entry() erases the entry it discards
+        bool chosen = false;
+        for (const auto& candidate : candidates)
+            if (candidate.first == i && candidate.second == longest) { chosen = true; break; }
+        if (!chosen) continue;
+        if (!discard_entry(i)) continue;           // a failed move/removal: leave the entry in the index
         ++discarded;
         ++compacted_;
     }

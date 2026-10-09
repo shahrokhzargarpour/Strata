@@ -200,6 +200,10 @@ public:
     // describes nothing it will send. A stored copy the prompt EXTENDS is the normal turn and is kept; a copy whose
     // header does not match the prompt is another conversation and is left alone. A copy whose common prefix is
     // shorter than `divergence_tokens` while its header still matches is discarded and counted in compacted().
+    // T2 ETAPA A: the discard is per conversation, not per tier - among the copies whose header the prompt shares,
+    // only the one that shares the LONGEST prefix with it is discarded, so a sibling session of the same assistant
+    // (same system prompt, different conversation) never loses its copy; when the longest prefix is tied by copies
+    // that are not copies of one another, nothing is discarded and the tie is logged.
     // Returns how many were discarded. The prompt's token type is the caller's (the serve loop reads int64).
     template<class Token>
     size_t discard_diverged(const std::vector<Token>& prompt, bool cvec, size_t divergence_tokens, int64_t turn_token) {
