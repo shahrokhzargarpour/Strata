@@ -133,6 +133,46 @@ D5aConv d5a_conv(size_t tail = 5000) {
     for (int32_t i = 0; i < 100; ++i) c.compacted[(size_t) c.header + (size_t) i] = int32_t(70000 + i);
     return c;
 }
+// ---- T2 ETAPA A (A1) helpers: two sibling sessions of one assistant ----
+// How many tokens two id lists share from the start.
+size_t x_shared_prefix(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+    const size_t n = a.size() < b.size() ? a.size() : b.size();
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+// A chat whose template carries few-shot turns INSIDE the system prompt: three turn markers before the first real
+// user turn, so conversation_header_length ends inside the shared root and every session of this assistant shares
+// one header. `seed` is what makes it a session of its own: the first exchange after the root is seed-specific.
+// `compacted` is the same session after the client rewrote its tail (a summarised history): the root and the first
+// exchange are kept, everything past them is new.
+struct XSession {
+    std::vector<int32_t> ids;
+    std::vector<int32_t> compacted;
+    int64_t turn = 500;
+    size_t root = 0;      // the shared system prompt, in tokens (what every sibling of this assistant shares)
+    size_t header = 0;    // where conversation_header_length says the header ends (inside the root)
+};
+XSession x_session(int32_t seed, size_t tail) {
+    XSession s;
+    for (int32_t i = 1; i <= 40; ++i) s.ids.push_back(i);        // the system prompt, part 1
+    s.ids.push_back((int32_t) s.turn);                            // 1st turn marker: inside the system prompt
+    for (int32_t i = 41; i <= 70; ++i) s.ids.push_back(i);        // a few-shot example turn
+    s.ids.push_back((int32_t) s.turn);                            // 2nd turn marker: still inside it
+    for (int32_t i = 71; i <= 100; ++i) s.ids.push_back(i);       // the few-shot answer
+    s.ids.push_back((int32_t) s.turn);                            // 3rd turn marker: the "header" ends HERE
+    s.root = s.ids.size();
+    s.header = conversation_header_length(s.ids, s.turn);
+    for (int32_t i = 0; i < 20; ++i) s.ids.push_back(seed + 1000 + i);   // this session's first user turn
+    s.ids.push_back((int32_t) s.turn);
+    for (int32_t i = 0; i < 20; ++i) s.ids.push_back(seed + 2000 + i);   // and its first answer
+    s.ids.push_back((int32_t) s.turn);
+    for (size_t i = 0; i < tail; ++i) s.ids.push_back((int32_t) (seed + 3000 + (int32_t) i));
+    const size_t kept = s.root + 41;      // the root plus the first exchange: what a compaction keeps
+    s.compacted.assign(s.ids.begin(), s.ids.begin() + (std::ptrdiff_t) kept);
+    for (size_t i = 0; i < 50; ++i) s.compacted.push_back((int32_t) (90000 + i));   // the rewritten tail
+    return s;
+}
 size_t d5a_count_ext(const fs::path& archive, const std::string& ext) {
     size_t n = 0;
     if (!fs::exists(archive)) return 0;
@@ -893,6 +933,62 @@ int main() {
 #ifdef _MSC_VER
         if (hold != -1) _close(hold);
 #endif
+    }
+
+    // ---- T2 ETAPA A / A1: the cross-session defect (the compaction pass must stay per conversation) ----
+    // Two sibling sessions of one assistant share the system prompt. With a template that carries few-shot turns
+    // inside that prompt, the third turn marker - what conversation_header_length calls the end of the header -
+    // falls inside the shared root, so the old guard "the shared prefix reaches the stored copy's header" was
+    // satisfied by a sibling: compacting A archived B's copy too, and one request logged "discarded 2 compacted".
+    // A's own compaction must still archive A's own copy (the anti over-fix half of the same case).
+    fs::remove_all(dir);
+    {
+        ConversationSpillCache c;
+        check(c.open(dir, id, 1ull << 30, error), "X: open the tier");
+        strata::core::SpillArchiveConfig cfg{dir / "archive", SpillArchiveMode::state, 64ull << 20, 0, 0, 500};
+        check(c.open_archive(cfg, error), "X: open the archive");
+        const XSession a = x_session(1, 1000), b = x_session(2, 1000);
+        check(a.header < a.root, "X: the header ends inside the shared system prompt");
+        check(x_shared_prefix(a.ids, b.ids) == a.root, "X: the siblings share the root and nothing past it");
+        check(x_shared_prefix(a.ids, a.compacted) < 4096, "X: the compaction diverges inside divergence_tokens");
+        check(x_shared_prefix(a.ids, a.compacted) > a.root, "X: the compaction keeps A's own head");
+
+        check(c.spill(conversation_with_ids(a.ids), error), "X: session A parked its copy");
+        std::string a_path;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.path().extension() == ".sess") a_path = e.path().string();
+        check(!a_path.empty(), "X: A's session file is on the tier");
+        const std::vector<uint8_t> a_before = read_file_bytes(a_path);
+        check(c.spill(conversation_with_ids(b.ids), error), "X: session B parked its own copy");
+        std::string b_path;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.path().extension() == ".sess" && e.path().string() != a_path) b_path = e.path().string();
+        check(!b_path.empty(), "X: B's session file is on the tier");
+        const std::vector<uint8_t> b_before = read_file_bytes(b_path);
+        check(c.size() == 2, "X: two sibling copies on the tier");
+
+        // A compacts (the client rewrote A's tail). B sends nothing: its copy must not be touched.
+        const size_t discarded = c.discard_diverged(a.compacted, false, 4096, a.turn);
+        if (discarded != 1)
+            std::fprintf(stderr, "X: one request discarded %zu copies (compacted=%zu, tier=%zu); expected 1\n",
+                         discarded, c.compacted(), c.size());
+        check(discarded == 1, "X: one request discards one copy - A's own, never the sibling's");
+        check(c.compacted() == 1, "X: one compaction counted");
+        check(c.size() == 1, "X: one copy left on the tier");
+        check(fs::exists(b_path), "X: B's session file survived A's compaction");
+        check(read_file_bytes(b_path) == b_before, "X: B's copy is byte-for-byte untouched");
+        check(!fs::exists(a_path), "X: A's copy left the tier");
+        check(a_before != b_before, "X: the two copies really are different conversations");
+        check(c.archived() == 1 && d5a_count_ext(dir / "archive", ".sess") == 1,
+              "X: A's own copy is what reached the archive");
+        // B still resumes from its own copy (the archive never becomes its resume source, and B never lost anything)
+        std::vector<int32_t> b_next = b.ids;
+        b_next.push_back(int32_t(7777));
+        const auto hit = c.best(b_next, {}, false, 0.0, 0);
+        check(bool(hit) && hit.path == b_path, "X: B still resumes from its own copy");
+        // and A's next park writes the compacted history, as it always did
+        check(c.spill(conversation_with_ids(a.compacted), error), "X: A reparcs its compacted history");
+        check(c.size() == 2, "X: both siblings are on the tier again");
     }
 
     fs::remove_all(dir);
